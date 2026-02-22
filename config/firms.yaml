@@ -1,0 +1,21 @@
+firms:
+  core:
+    - Citadel
+    - Millennium
+    - Point72
+    - D. E. Shaw
+    - Two Sigma
+    - Balyasny
+    - Schonfeld
+    - ExodusPoint
+    - Jane Street
+    - Hudson River Trading
+    - Jump Trading
+
+  expansion_candidates:
+    - Bridgewater
+    - Renaissance Technologies
+    - AQR Capital Management
+    - Man Group
+    - Marshall Wace
+    - DE Shaw (alt spelling)
