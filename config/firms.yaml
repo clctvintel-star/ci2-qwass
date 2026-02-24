@@ -1,3 +1,13 @@
+# config/firms.yaml
+# V1 philosophy: high precision > high recall.
+# - NO single-word aliases (e.g., "Jump", "Jane", "HRT")
+# - NO acronyms unless they are unambiguous (in practice, almost none are)
+# - Prefer official-ish names and common long forms only
+# - People/person mentions handled later (separate config)
+
+version: 1
+last_updated: "2026-02-23"
+
 firms:
   core:
     - Citadel
@@ -14,8 +24,231 @@ firms:
 
   expansion_candidates:
     - Bridgewater
+    - AQR
     - Renaissance Technologies
-    - AQR Capital Management
     - Man Group
     - Marshall Wace
-    - DE Shaw (alt spelling)
+
+# Canonical firm records.
+# Each key here is the canonical name you want to use everywhere in QWASS2 outputs.
+firm_definitions:
+
+  Citadel:
+    canonical: "Citadel"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Citadel"
+      - "Citadel LLC"
+      - "Citadel Securities"     # note: distinct entity but reputationally related; keep for now
+      - "Citadel Securities LLC"
+    notes: "V1 includes Citadel Securities because it frequently appears in coverage tied to the Citadel brand."
+
+  Millennium:
+    canonical: "Millennium"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Millennium Management"
+      - "Millennium Management LLC"
+      - "Millennium"
+      - "Millennium Hedge Fund"
+    notes: "Avoid 'MLP' or other abbreviations; too ambiguous."
+
+  Point72:
+    canonical: "Point72"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Point72"
+      - "Point72 Asset Management"
+      - "Point72 Asset Management, L.P."
+      - "Point72 Asset Management LP"
+      - "Point72 Ventures"
+      - "Cubist Systematic Strategies"
+      - "Cubist Systematic"
+      - "Cubist"
+    notes: "V1 keeps Cubist because it’s a meaningful sub-brand and often appears without Point72."
+
+  "D. E. Shaw":
+    canonical: "D. E. Shaw"
+    category: "hedge_fund"
+    aliases_safe:
+      - "D. E. Shaw"
+      - "D.E. Shaw"
+      - "DE Shaw"
+      - "The D. E. Shaw Group"
+      - "The D.E. Shaw Group"
+      - "D. E. Shaw Group"
+      - "D.E. Shaw Group"
+      - "DE Shaw Group"
+    notes: "V1 avoids 'DES' acronym; too ambiguous."
+
+  "Two Sigma":
+    canonical: "Two Sigma"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Two Sigma"
+      - "Two Sigma Investments"
+      - "Two Sigma Investments, LP"
+      - "Two Sigma Investments LP"
+      - "Two Sigma Advisers"
+      - "Two Sigma Advisers, LP"
+      - "Two Sigma Advisers LP"
+      - "Two Sigma Securities"
+      - "Two Sigma Securities, LLC"
+    notes: "Two Sigma has multiple entities; V1 includes common long forms."
+
+  Balyasny:
+    canonical: "Balyasny"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Balyasny"
+      - "Balyasny Asset Management"
+      - "Balyasny Asset Management LP"
+      - "Balyasny Asset Management, L.P."
+      - "BAM"
+    notes: "BAM is borderline; keep only if you later add guardrails. If you want maximum safety, delete 'BAM' now."
+
+  Schonfeld:
+    canonical: "Schonfeld"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Schonfeld"
+      - "Schonfeld Strategic Advisors"
+      - "Schonfeld Strategic Advisors LLC"
+      - "Schonfeld Strategic Advisors, LLC"
+    notes: "No acronym variants in V1."
+
+  ExodusPoint:
+    canonical: "ExodusPoint"
+    category: "hedge_fund"
+    aliases_safe:
+      - "ExodusPoint"
+      - "ExodusPoint Capital"
+      - "ExodusPoint Capital Management"
+      - "ExodusPoint Capital Management LP"
+      - "ExodusPoint Capital Management, LP"
+    notes: "ExodusPoint is fairly unique; safe."
+
+  "Jane Street":
+    canonical: "Jane Street"
+    category: "trading_firm"
+    aliases_safe:
+      - "Jane Street"
+      - "Jane Street Capital"
+      - "Jane Street Capital, LLC"
+      - "Jane Street Capital LLC"
+    notes: "Do NOT match 'Jane' or 'Street'. Phrase-only in V1."
+
+  "Hudson River Trading":
+    canonical: "Hudson River Trading"
+    category: "trading_firm"
+    aliases_safe:
+      - "Hudson River Trading"
+      - "Hudson River Trading LLC"
+      - "Hudson River Trading, LLC"
+    notes: "Do NOT use 'HRT' in V1."
+
+  "Jump Trading":
+    canonical: "Jump Trading"
+    category: "trading_firm"
+    aliases_safe:
+      - "Jump Trading"
+      - "Jump Trading LLC"
+      - "Jump Trading, LLC"
+      - "Jump Crypto"
+    notes: "Do NOT use 'Jump' in V1. 'Jump Crypto' is usually legit."
+
+  Bridgewater:
+    canonical: "Bridgewater"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Bridgewater"
+      - "Bridgewater Associates"
+      - "Bridgewater Associates LP"
+      - "Bridgewater Associates, LP"
+    notes: "Expansion candidate; safe long forms."
+
+  AQR:
+    canonical: "AQR"
+    category: "asset_manager"
+    aliases_safe:
+      - "AQR"
+      - "AQR Capital Management"
+      - "AQR Capital Management LLC"
+      - "AQR Capital Management, LLC"
+    notes: "AQR is short but relatively unambiguous in finance; keep."
+
+  "Renaissance Technologies":
+    canonical: "Renaissance Technologies"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Renaissance Technologies"
+      - "Renaissance Technologies LLC"
+      - "Renaissance Technologies, LLC"
+      - "Renaissance"
+      - "RenTec"
+    notes: "‘Renaissance’ is risky outside finance. If you want max safety, remove 'Renaissance' and keep only 'Renaissance Technologies' + 'RenTec'."
+
+  "Man Group":
+    canonical: "Man Group"
+    category: "asset_manager"
+    aliases_safe:
+      - "Man Group"
+      - "Man Group plc"
+      - "Man Group PLC"
+      - "AHL"
+      - "Man AHL"
+    notes: "AHL is a known sub-brand; still somewhat risky. Optional in V1."
+
+  "Marshall Wace":
+    canonical: "Marshall Wace"
+    category: "hedge_fund"
+    aliases_safe:
+      - "Marshall Wace"
+      - "Marshall Wace LLP"
+      - "Marshall Wace, LLP"
+    notes: "Fairly unique; safe."
+
+# Source tier weights used by quality weighting logic (your chosen finals).
+source_tiers:
+  tier_weights:
+    tier_1: 1.00
+    tier_2: 0.90
+    tier_3: 0.80
+    tier_4: 0.65
+    tier_5: 0.45
+
+# Model IDs are configuration, not secrets.
+# (Keys live in /MyDrive/CI2/ci2_keys.env and are never committed.)
+models:
+  primary_scorers:
+    gemini: "gemini-1.5-pro-latest"
+    claude: "claude-3-haiku-20240307"
+  precheck:
+    openai: "gpt-4o"
+  tiebreaker:
+    openai: "gpt-4-turbo"
+
+paths:
+  # system-of-record directories (Drive)
+  db_root: "/MyDrive/CI2/db/"
+  outputs_root: "/MyDrive/CI2/outputs/"
+  keys_env: "/MyDrive/CI2/ci2_keys.env"
+
+# Explicitly state credential policy for humans reading the repo.
+credential_policy:
+  store_keys_in_drive_env_file: true
+  never_commit_keys_to_git: true
+  never_store_keys_in_notebooks: true
+  notes: "Keys must live in Google Drive at /MyDrive/CI2/ci2_keys.env. Repo contains no secrets."
+
+# Placeholder for future, but intentionally empty in V1 to avoid false positives.
+# We’ll add 'aliases_risky' + guardrails in V2 (Week 3+).
+risky_alias_policy:
+  enabled: false
+  examples_disallowed_in_v1:
+    - "Jump"
+    - "HRT"
+    - "Jane"
+    - "Street"
+    - "DES"
+    - "MLP"
