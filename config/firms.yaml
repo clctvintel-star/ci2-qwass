@@ -5,6 +5,8 @@
 # - Prefer official-ish names and common long forms only
 # - People/person mentions handled later (separate config)
 
+# NOTE: ADD REDDIT-ONLY ALIASES LIKE JS
+
 version: 1
 last_updated: "2026-02-23"
 
