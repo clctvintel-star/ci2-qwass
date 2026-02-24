@@ -1,0 +1,19 @@
+ci2:
+  drive_root: /content/drive/MyDrive/CI2
+
+projects:
+  qwass2:
+    db: db/qwass2
+    outputs: outputs/qwass2
+  scum2:
+    db: db/scum2
+    outputs: outputs/scum2
+  werk2:
+    db: db/werk2
+    outputs: outputs/werk2
+  dorian2:
+    db: db/dorian2
+    outputs: outputs/dorian2
+
+keys:
+  env_file: ci2_keys.env
