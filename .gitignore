@@ -1,1 +1,19 @@
+# Secrets
+.env
+*.env
+*keys*
+*.json
 
+# Data & outputs
+*.xlsx
+*.csv
+*.parquet
+outputs/
+data/
+
+# Python
+__pycache__/
+*.pyc
+
+# Mac
+.DS_Store
