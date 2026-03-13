@@ -38,10 +38,6 @@ def load_firms() -> list[str]:
     with open(FIRMS_CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    # Supports:
-    # 1) firms: [ ... ]
-    # 2) firms: { core: [ ... ], ... }
-    # 3) top-level core: [ ... ]
     if isinstance(cfg.get("firms"), list):
         firms = cfg["firms"]
     elif isinstance(cfg.get("firms"), dict):
@@ -49,12 +45,10 @@ def load_firms() -> list[str]:
     elif isinstance(cfg.get("core"), list):
         firms = cfg["core"]
     else:
-        raise ValueError(
-            "Could not find firm universe in config/firms.yaml. "
-            "Expected one of: firms: [...], firms: {core: [...]}, or core: [...]."
-        )
+        raise ValueError("Could not find firm universe in config/firms.yaml")
 
     firms = [str(x).strip() for x in firms if str(x).strip()]
+
     if not firms:
         raise ValueError("Firm universe is empty in config/firms.yaml")
 
