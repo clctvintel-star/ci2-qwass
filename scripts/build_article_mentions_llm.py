@@ -18,7 +18,7 @@ from scripts.env import get_project_paths, get_keys_env_path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIRMS_CONFIG_PATH = REPO_ROOT / "config" / "firms.yaml"
-PROMPT_VERSION = "article_mentions_llm_v2"
+PROMPT_VERSION = "article_mentions_llm_v3"
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 MIN_WORDS_FOR_VERIFICATION = 200
@@ -102,21 +102,34 @@ You are a careful financial-news annotator working on financial firm media cover
 
 Your task is to identify which firms from the provided universe are clearly mentioned in the article and classify each mentioned firm as either CENTRAL or PERIPHERAL.
 
-Definitions:
-- CENTRAL = the firm is a primary subject of the story, named in the headline or discussed as a main actor, focus, or target.
-- PERIPHERAL = the firm is mentioned meaningfully but is not a main focus of the story.
+Core definitions:
+- CENTRAL = the firm is one of the main subjects of the article itself. The article materially discusses the firm’s actions, strategy, leadership, business activity, results, transactions, legal issues, hiring, departures, launches, closures, or other substantive developments.
+- PERIPHERAL = the firm is mentioned meaningfully, but the article is not mainly about that firm.
 - Do not output firms that are not actually mentioned.
-- Do not infer firms from people, industries, ambiguous acronyms, or similar words unless the article text clearly refers to the firm.
-- Be conservative. If a firm is not clearly mentioned, omit it.
+- Be conservative. If a firm is not clearly mentioned in the narrative text, omit it.
 - Use only the provided article text.
 - Output valid JSON only.
 
-Very important exclusions:
-- Ignore firms that appear only in photo captions, image credits, illustration text, logo montages, stock-image descriptions, or page furniture.
-- Ignore firms that appear only in generic roster lists, comparison lists, league tables, or “company logos shown” text unless the article materially discusses them.
-- A firm should be CENTRAL only if the story materially discusses that firm.
-- A firm that appears only in a list, comparison, or passing aside should usually be PERIPHERAL, not CENTRAL.
-- Do not classify firms that are visible only because of a graphic, chart, logo collage, sidebar, or image description.
+Important distinction:
+A firm is NOT CENTRAL if it appears only as:
+- an industry example
+- one item in a list of firms
+- a competitor or peer
+- a former employer of a person discussed
+- a client example for another company
+- a contextual reference to the industry
+- a passing comparison point
+- a logo, image caption, photo credit, chart label, sidebar, page furniture, or stock-image description
+- a generic “firms like X, Y, Z” or “including X, Y, Z” construction
+- a broad roster of clients, investors, employers, or market participants
+
+If a firm appears only in those contexts, classify it as PERIPHERAL, not CENTRAL.
+
+Additional guidance:
+- CENTRAL usually means the article could reasonably be described as being about that firm.
+- Typically an article will have 0–2 CENTRAL firms. If more than 2 firms seem CENTRAL, reconsider carefully.
+- If the article mainly discusses a person, recruiter, conference, technology trend, market theme, or another company outside the firm universe, then firms from the universe are usually PERIPHERAL unless one of them is itself a main subject.
+- Do not infer firms from ambiguous acronyms, similar words, or non-firm uses of names.
 
 Be especially careful about false positives such as:
 - "prices jumped" ≠ Jump Trading
@@ -223,7 +236,7 @@ def call_gemini(prompt: str, model_name: str, api_key: str) -> dict[str, Any]:
         model=model_name,
         contents=prompt,
         config=types.GenerateContentConfig(
-            temperature=0.1,
+            temperature=0.0,
             response_mime_type="application/json",
         ),
     )
