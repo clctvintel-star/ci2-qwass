@@ -21,8 +21,8 @@ FIRMS_CONFIG_PATH = REPO_ROOT / "config" / "firms.yaml"
 PROMPT_VERSION = "article_mentions_llm_v2"
 DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Conservative threshold for "too short to verify mentions confidently"
-MIN_SUMMARY_CHARS_FOR_VERIFICATION = 250
+MIN_WORDS_FOR_VERIFICATION = 200
+LIKELY_FULL_ARTICLE_WORDS = 500
 
 
 def load_env_file(path: Path) -> None:
@@ -63,25 +63,29 @@ def load_firms() -> list[str]:
     return firms
 
 
+def word_count(text: str) -> int:
+    text = (text or "").strip()
+    if not text:
+        return 0
+    return len(re.findall(r"\b\w+\b", text))
+
+
 def derive_text_completeness(row: pd.Series) -> str:
     title = str(row.get("title", "") or "").strip()
     summary = str(row.get("summary", "") or "").strip()
+    wc = word_count(summary)
 
     if title and not summary:
         return "title_only"
-
-    if title and summary:
-        if len(summary) > 4000:
-            return "full_text"
-        if len(summary) > 1500:
-            return "extended_summary"
-        return "title_plus_summary"
-
-    return "title_only"
+    if wc < MIN_WORDS_FOR_VERIFICATION:
+        return "short_snippet"
+    if wc <= LIKELY_FULL_ARTICLE_WORDS:
+        return "summary_or_short_article"
+    return "likely_full_article"
 
 
 def is_summary_too_short(summary: str) -> bool:
-    return len((summary or "").strip()) < MIN_SUMMARY_CHARS_FOR_VERIFICATION
+    return word_count(summary) < MIN_WORDS_FOR_VERIFICATION
 
 
 def build_prompt(
@@ -102,14 +106,14 @@ Definitions:
 - CENTRAL = the firm is a primary subject of the story, named in the headline or discussed as a main actor, focus, or target.
 - PERIPHERAL = the firm is mentioned meaningfully but is not a main focus of the story.
 - Do not output firms that are not actually mentioned.
-- Do not infer firms from people, industries, ambiguous acronyms, or similar words unless the article text clearly refers to the financial firm.
+- Do not infer firms from people, industries, ambiguous acronyms, or similar words unless the article text clearly refers to the firm.
 - Be conservative. If a firm is not clearly mentioned, omit it.
 - Use only the provided article text.
 - Output valid JSON only.
 
 Very important exclusions:
 - Ignore firms that appear only in photo captions, image credits, illustration text, logo montages, stock-image descriptions, or page furniture.
-- Ignore firms that appear only in generic roster lists, comparison lists, or “company logos shown” text unless the article materially discusses them.
+- Ignore firms that appear only in generic roster lists, comparison lists, league tables, or “company logos shown” text unless the article materially discusses them.
 - A firm should be CENTRAL only if the story materially discusses that firm.
 - A firm that appears only in a list, comparison, or passing aside should usually be PERIPHERAL, not CENTRAL.
 - Do not classify firms that are visible only because of a graphic, chart, logo collage, sidebar, or image description.
@@ -281,6 +285,7 @@ def main():
         summary = str(row["summary"])
         original_url = str(row["url"])
         text_completeness = derive_text_completeness(row)
+        summary_word_count = word_count(summary)
         summary_too_short = is_summary_too_short(summary)
 
         prompt = build_prompt(
@@ -305,6 +310,7 @@ def main():
                         "evidence_text": "",
                         "model_confidence": "",
                         "text_completeness": text_completeness,
+                        "summary_word_count": summary_word_count,
                         "summary_too_short": summary_too_short,
                         "model_name": args.model,
                         "prompt_version": PROMPT_VERSION,
@@ -324,6 +330,7 @@ def main():
                             "evidence_text": m["evidence_text"],
                             "model_confidence": m["model_confidence"],
                             "text_completeness": text_completeness,
+                            "summary_word_count": summary_word_count,
                             "summary_too_short": summary_too_short,
                             "model_name": args.model,
                             "prompt_version": PROMPT_VERSION,
@@ -343,6 +350,7 @@ def main():
                     "evidence_text": "",
                     "model_confidence": "",
                     "text_completeness": text_completeness,
+                    "summary_word_count": summary_word_count,
                     "summary_too_short": summary_too_short,
                     "model_name": args.model,
                     "prompt_version": PROMPT_VERSION,
