@@ -10,13 +10,19 @@ from typing import Any
 
 import pandas as pd
 import yaml
+from google import genai
+from google.genai import types
 
 from scripts.env import get_project_paths, get_keys_env_path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIRMS_CONFIG_PATH = REPO_ROOT / "config" / "firms.yaml"
-PROMPT_VERSION = "article_mentions_llm_v1"
+PROMPT_VERSION = "article_mentions_llm_v2"
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+# Conservative threshold for "too short to verify mentions confidently"
+MIN_SUMMARY_CHARS_FOR_VERIFICATION = 250
 
 
 def load_env_file(path: Path) -> None:
@@ -38,10 +44,6 @@ def load_firms() -> list[str]:
     with open(FIRMS_CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
 
-    # Supports:
-    # 1) firms: [ ... ]
-    # 2) firms: { core: [ ... ], ... }
-    # 3) top-level core: [ ... ]
     if isinstance(cfg.get("firms"), list):
         firms = cfg["firms"]
     elif isinstance(cfg.get("firms"), dict):
@@ -78,6 +80,10 @@ def derive_text_completeness(row: pd.Series) -> str:
     return "title_only"
 
 
+def is_summary_too_short(summary: str) -> bool:
+    return len((summary or "").strip()) < MIN_SUMMARY_CHARS_FOR_VERIFICATION
+
+
 def build_prompt(
     article_id: str,
     title: str,
@@ -96,17 +102,23 @@ Definitions:
 - CENTRAL = the firm is a primary subject of the story, named in the headline or discussed as a main actor, focus, or target.
 - PERIPHERAL = the firm is mentioned meaningfully but is not a main focus of the story.
 - Do not output firms that are not actually mentioned.
-- Do not infer firms from people, industries, ambiguous acronyms, or similar words unless the article text clearly refers to the firm.
+- Do not infer firms from people, industries, ambiguous acronyms, or similar words unless the article text clearly refers to the financial firm.
 - Be conservative. If a firm is not clearly mentioned, omit it.
 - Use only the provided article text.
 - Output valid JSON only.
+
+Very important exclusions:
+- Ignore firms that appear only in photo captions, image credits, illustration text, logo montages, stock-image descriptions, or page furniture.
+- Ignore firms that appear only in generic roster lists, comparison lists, or “company logos shown” text unless the article materially discusses them.
+- A firm should be CENTRAL only if the story materially discusses that firm.
+- A firm that appears only in a list, comparison, or passing aside should usually be PERIPHERAL, not CENTRAL.
+- Do not classify firms that are visible only because of a graphic, chart, logo collage, sidebar, or image description.
 
 Be especially careful about false positives such as:
 - "prices jumped" ≠ Jump Trading
 - "Hudson River" ≠ Hudson River Trading
 - "HRT" may refer to something unrelated
 - "Citadel alumni" or "military academy" may not refer to the financial firm
-- lists of firms may imply PERIPHERAL mention, not CENTRAL
 
 FIRM UNIVERSE:
 {universe}
@@ -135,8 +147,8 @@ Return a JSON object with this exact structure:
 }}
 
 Rules:
-- Only include firms from the universe that are clearly mentioned in the text.
-- If no firms from the universe are clearly mentioned, return:
+- Only include firms from the universe that are clearly mentioned in the narrative text.
+- If no firms from the universe are clearly mentioned in the narrative text, return:
   {{"article_id": "{article_id}", "mentions": []}}
 - Do not include NOT_MENTIONED firms.
 - Do not output any text outside the JSON object.
@@ -145,8 +157,6 @@ Rules:
 
 def extract_json(text: str) -> dict[str, Any]:
     text = text.strip()
-
-    # Remove fenced code block if present
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
 
@@ -189,7 +199,6 @@ def normalize_mentions(data: dict[str, Any], firms: list[str]) -> list[dict[str,
             }
         )
 
-    # Deduplicate same firm if model repeats it; prefer CENTRAL over PERIPHERAL
     deduped: dict[str, dict[str, str]] = {}
     for row in cleaned:
         firm = row["firm"]
@@ -203,28 +212,16 @@ def normalize_mentions(data: dict[str, Any], firms: list[str]) -> list[dict[str,
     return list(deduped.values())
 
 
-def call_gemini(prompt: str, model_name: str) -> dict[str, Any]:
-    try:
-        import google.generativeai as genai
-    except ImportError as e:
-        raise ImportError(
-            "google-generativeai is not installed. In Colab run: "
-            "!pip install -q google-generativeai"
-        ) from e
+def call_gemini(prompt: str, model_name: str, api_key: str) -> dict[str, Any]:
+    client = genai.Client(api_key=api_key)
 
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise EnvironmentError("Need GOOGLE_API_KEY or GEMINI_API_KEY in environment")
-
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-
-    response = model.generate_content(
-        prompt,
-        generation_config={
-            "temperature": 0.1,
-            "response_mime_type": "application/json",
-        },
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_mime_type="application/json",
+        ),
     )
 
     return extract_json(response.text)
@@ -234,42 +231,20 @@ def main():
     parser = argparse.ArgumentParser(
         description="Build ARTICLE_MENTIONS_LLM from master_articles.csv using Gemini."
     )
-    parser.add_argument(
-        "--project",
-        default="qwass2",
-        help="Project key from config/paths.yaml (default: qwass2)",
-    )
-    parser.add_argument(
-        "--input-name",
-        default="master_articles.csv",
-        help="Input CSV filename in db dir",
-    )
-    parser.add_argument(
-        "--output-name",
-        default="article_mentions_llm_v1.csv",
-        help="Output CSV filename in db dir",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=25,
-        help="Number of articles to classify (default: 25 for pilot)",
-    )
-    parser.add_argument(
-        "--offset",
-        type=int,
-        default=0,
-        help="Start row offset in master_articles (default: 0)",
-    )
-    parser.add_argument(
-        "--model",
-        default=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
-        help="Gemini model name",
-    )
+    parser.add_argument("--project", default="qwass2")
+    parser.add_argument("--input-name", default="master_articles.csv")
+    parser.add_argument("--output-name", default="article_mentions_llm_v1.csv")
+    parser.add_argument("--limit", type=int, default=25)
+    parser.add_argument("--offset", type=int, default=0)
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     args = parser.parse_args()
 
     keys_path = get_keys_env_path()
     load_env_file(keys_path)
+
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise EnvironmentError("Need GOOGLE_API_KEY or GEMINI_API_KEY in environment")
 
     firms = load_firms()
     paths = get_project_paths(args.project)
@@ -281,16 +256,16 @@ def main():
 
     if not input_path.exists():
         raise FileNotFoundError(f"Missing input file: {input_path}")
-
-    print(f"Loading master articles: {input_path}")
-    master_articles = pd.read_csv(input_path)
-
     if args.offset < 0:
         raise ValueError("--offset must be >= 0")
 
+    print(f"Loading master articles: {input_path}")
+    master_articles = pd.read_csv(input_path)
+    master_articles["title"] = master_articles["title"].fillna("")
+    master_articles["summary"] = master_articles["summary"].fillna("")
+    master_articles["url"] = master_articles["url"].fillna("")
+
     subset = master_articles.iloc[args.offset : args.offset + args.limit].copy()
-    subset["title"] = subset["title"].fillna("")
-    subset["summary"] = subset["summary"].fillna("")
 
     print(f"Loaded {len(master_articles)} total articles")
     print(f"Running pilot on {len(subset)} rows (offset={args.offset}, limit={args.limit})")
@@ -302,9 +277,11 @@ def main():
 
     for _, row in subset.iterrows():
         article_id = str(row["article_id"])
-        title = str(row.get("title", "") or "")
-        summary = str(row.get("summary", "") or "")
+        title = str(row["title"])
+        summary = str(row["summary"])
+        original_url = str(row["url"])
         text_completeness = derive_text_completeness(row)
+        summary_too_short = is_summary_too_short(summary)
 
         prompt = build_prompt(
             article_id=article_id,
@@ -315,18 +292,20 @@ def main():
         )
 
         try:
-            data = call_gemini(prompt=prompt, model_name=args.model)
+            data = call_gemini(prompt=prompt, model_name=args.model, api_key=api_key)
             mentions = normalize_mentions(data, firms)
 
             if not mentions:
                 out_rows.append(
                     {
                         "article_id": article_id,
+                        "original_url": original_url,
                         "firm": "",
                         "mention_type": "",
                         "evidence_text": "",
                         "model_confidence": "",
                         "text_completeness": text_completeness,
+                        "summary_too_short": summary_too_short,
                         "model_name": args.model,
                         "prompt_version": PROMPT_VERSION,
                         "classified_at": timestamp,
@@ -339,11 +318,13 @@ def main():
                     out_rows.append(
                         {
                             "article_id": article_id,
+                            "original_url": original_url,
                             "firm": m["firm"],
                             "mention_type": m["mention_type"],
                             "evidence_text": m["evidence_text"],
                             "model_confidence": m["model_confidence"],
                             "text_completeness": text_completeness,
+                            "summary_too_short": summary_too_short,
                             "model_name": args.model,
                             "prompt_version": PROMPT_VERSION,
                             "classified_at": timestamp,
@@ -356,11 +337,13 @@ def main():
             out_rows.append(
                 {
                     "article_id": article_id,
+                    "original_url": original_url,
                     "firm": "",
                     "mention_type": "",
                     "evidence_text": "",
                     "model_confidence": "",
                     "text_completeness": text_completeness,
+                    "summary_too_short": summary_too_short,
                     "model_name": args.model,
                     "prompt_version": PROMPT_VERSION,
                     "classified_at": timestamp,
