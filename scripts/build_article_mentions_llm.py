@@ -23,6 +23,7 @@ DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 MIN_WORDS_FOR_VERIFICATION = 200
 LIKELY_FULL_ARTICLE_WORDS = 500
+AUTOSAVE_EVERY = 50
 
 
 def load_env_file(path: Path) -> None:
@@ -285,15 +286,35 @@ def main():
     subset = master_articles.iloc[args.offset : args.offset + args.limit].copy()
 
     print(f"Loaded {len(master_articles)} total articles")
-    print(f"Running pilot on {len(subset)} rows (offset={args.offset}, limit={args.limit})")
+    print(f"Running batch on {len(subset)} rows (offset={args.offset}, limit={args.limit})")
     print(f"Model: {args.model}")
     print(f"Firm universe size: {len(firms)}")
 
-    out_rows: list[dict[str, Any]] = []
     timestamp = datetime.now(timezone.utc).isoformat()
+
+    existing_rows: list[dict[str, Any]] = []
+    processed_article_ids = set()
+
+    if output_path.exists():
+        existing_df = pd.read_csv(output_path)
+        existing_rows = existing_df.to_dict("records")
+        processed_article_ids = set(existing_df["article_id"].astype(str))
+        print(f"Loaded {len(existing_rows)} existing rows")
+        print(f"Found {len(processed_article_ids)} already-processed article_ids")
+    else:
+        print("No existing output file found, starting fresh.")
+
+    out_rows = existing_rows.copy()
+    processed_count = 0
+    skipped_count = 0
 
     for _, row in subset.iterrows():
         article_id = str(row["article_id"])
+
+        if article_id in processed_article_ids:
+            skipped_count += 1
+            continue
+
         title = str(row["title"])
         summary = str(row["summary"])
         original_url = str(row["url"])
@@ -374,12 +395,22 @@ def main():
             )
             print(f"Error on article_id={article_id}: {e}")
 
+        processed_count += 1
+        processed_article_ids.add(article_id)
+
+        if processed_count % AUTOSAVE_EVERY == 0:
+            autosave_df = pd.DataFrame(out_rows)
+            autosave_df.to_csv(output_path, index=False)
+            print(f"AUTOSAVE: {processed_count} new articles processed → {len(autosave_df)} total rows written")
+
     out_df = pd.DataFrame(out_rows)
     out_df.to_csv(output_path, index=False)
 
     print("\nBuild complete.")
-    print(f"Articles processed: {len(subset)}")
-    print(f"Output rows written: {len(out_df)}")
+    print(f"Articles in requested batch: {len(subset)}")
+    print(f"New articles processed this run: {processed_count}")
+    print(f"Already-processed articles skipped: {skipped_count}")
+    print(f"Total output rows written: {len(out_df)}")
     print(f"Saved to: {output_path}")
     print("\nStatus counts:")
     print(out_df["status"].value_counts(dropna=False))
