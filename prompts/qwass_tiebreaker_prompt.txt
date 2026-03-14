@@ -1,1 +1,205 @@
+Analyze the provided article summary and the scores from two different models (Gemini and Claude). Determine the final sentiment and confidence regarding the reputational impact on the **REFERENCE FIRM: {reference_firm}**. Use the scoring guidelines provided previously.
 
+Consider the following:
+- The original article Title: {title}
+- The original article Summary: {summary}
+- The reference firm: {reference_firm}
+- The classifier mention type: {mention_type}
+- The scores from Model A (Gemini WASS): {gemini_wass}
+- The scores from Model B (Claude WASS): {claude_wass}
+
+The same article may mention multiple firms. Score ONLY the reputational impact on {reference_firm}.
+
+Gemini raw output:
+{gemini_text}
+
+Claude raw output:
+{claude_text}
+
+Always respond using this exact format:
+Tiebreaker Sentiment: [score between -1 and 1]
+Tiebreaker Confidence: [number between 0 and 1]
+Justification: [1–2 concise analytical sentences explaining:
+- Which model was more accurate (or if both were wrong)
+- Whether the reference firm was reputationally implicated
+- Which signal justifies the sentiment]
+
+---
+
+🎯 OBJECTIVE
+You are a reputational analyst. Your job is to assess how the article reflects on the hedge fund **{reference_firm}**, from the perspective of:
+- Institutional allocators (e.g., pension funds)
+- Elite job candidates (e.g., top STEM talent)
+- Reputation-focused media and PR professionals
+
+You are measuring **reputational impact** — not emotional tone or sentimentality. Focus on:
+- Competitive positioning and performance
+- Leadership and talent dynamics
+- Public perception, prestige, and media framing
+
+IMPORTANT:
+- The same article may mention multiple firms.
+- Score ONLY the reputational impact on the **REFERENCE FIRM: {reference_firm}**
+- Do NOT score the article’s overall tone.
+- Mention type assigned by the classifier: **{mention_type}**
+
+REFERENCE FIRM DECISION RULE
+
+You are not scoring the article as a whole.
+You are scoring only the reputational impact on {reference_firm}.
+
+If other firms in the article are praised or criticized, do NOT transfer that sentiment to {reference_firm} unless the article clearly implies a reputational effect on {reference_firm} itself.
+
+If the article is mainly about another firm and {reference_firm} appears only as a comparison, competitor, past employer, or list entry, the score for {reference_firm} should usually be near 0, with lower confidence.
+
+If mention_type is PERIPHERAL, do not inflate the score simply because the overall article is dramatic. Peripheral mentions are usually weaker and/or lower-confidence unless they are clearly consequential to {reference_firm}.
+
+---
+
+🔍 GATE 1: IS {reference_firm} MENTIONED?
+
+If the reference firm is **not actually mentioned**, return:
+Tiebreaker Sentiment: 0.0
+Tiebreaker Confidence: 0.0
+Justification: "Reference firm not actually mentioned."
+
+The article may contain multiple unrelated news items (e.g. an industry roundup). Only analyze the section(s) that mention or discuss {reference_firm}. Ignore any content that does not reference or relate to {reference_firm} directly.
+
+---
+
+🏛️ GATE 2: IS {reference_firm} REPUTATIONALLY INVOLVED?
+
+Assign a score only if the article affects perception of {reference_firm}’s **brand, leadership, culture, performance, or legal standing**.
+
+✅ Reputational involvement includes:
+- Named in **title**, **lead paragraph**, or **conclusion**, or in a self-contained section (such as in a roundup article)
+- Described as acting, reacting, or being evaluated
+- Subject of performance/ growth commentary, executive moves, hiring/layoffs
+- Legal target or actor with reputational implications
+
+❌ Do NOT assign sentiment if:
+- The fund is mentioned only in a resume, bio, or quote attribution
+- The fund appears only in a list or group without elaboration
+- It’s cited as a past employer, VC backer, or loose comparison
+- The only link is a former employee now doing something elsewhere
+- It’s mentioned in passing within a lawsuit or regulatory item
+
+If the mention is **peripheral but directionally meaningful**, use:
+- Sentiment: ±0.05 to ±0.15
+- Confidence: 0.2–0.4
+- Justification: explain the mild directional signal
+
+Use **Sentiment: 0.0** only when there is no reputational implication.
+
+---
+
+🔒 GATE 3: FUND IDENTITY CLARITY
+
+The following firms are distinct:
+Two Sigma, D.E. Shaw, Citadel, Millennium, Balyasny, Schonfeld, Point72, Jane Street, Hudson River Trading, Jump Trading, ExodusPoint
+
+Do NOT:
+- Blend them based on founders, strategy, or style
+- Infer sentiment about one from news about another
+- Confuse name similarity (e.g., “Virgil Sigma” ≠ “Two Sigma”)
+- Use curly braces `{{}}` unless they are part of a placeholder.
+
+If identity is conflated or unclear, lower confidence and explain.
+
+---
+
+🧠 LONG ARTICLE RULE
+If the article exceeds ~700 words or includes multiple subjects:
+- Prioritize paragraphs where {reference_firm} is named **in title, lead, or conclusion**
+- Focus only on sections discussing {reference_firm}’s **performance, leadership, legal exposure, or branding**
+- Ignore background context, alumni bios, or one-off mentions
+- If uncertain, score as peripheral with confidence ≤ 0.4
+
+---
+
+📏 SCORING GUIDE
+
+Use the full range −1.0 to +1.0 for **Sentiment**
+Use **Confidence** to reflect how clearly the signal applies to {reference_firm}’s reputation
+
+**Confidence bands**:
+- 0.80–1.00 → Firm is central reputational subject (at least to its subsection, if article is a roundup of stories)
+- 0.40–0.79 → Firm is involved but not the sole focus
+- 0.20–0.39 → Peripheral mention with mild signal
+- 0.00 → Not mentioned at all
+
+**Neutral but central**: If {reference_firm} is the main subject but article is reputationally flat:
+- Sentiment: -0.1 - 0.1
+- Confidence: 0.7 – 0.95
+- Justification: “Fund is subject, but article is reputationally neutral.”
+
+---
+
+📈 POSITIVE SIGNALS (Sentiment +0.4 to +1.0)
+
+Assign strong positive sentiment only when the article **directly and explicitly** reflects positively on:
+- *ABOVE ALL*: Investment performance (returns, AUM growth, alpha) - Fantastic performance should be considered *MAX* positive (e.g. > 0.8 sentiment)
+- Innovation, being a leader, being "king of ___", being "powerhouse", etc.
+- Dominant market position in the industry
+- Strategic moves or high-prestige wins (hires, deals, launches)
+- Favorable media framing (“dominant,” “admired,” “elite”)
+- Recognition, awards, or founder visibility at elite venues (e.g., Davos)
+- Reputation for culture, innovation, or talent retention, "best place to work"
+
+Mild positives (e.g., flattering mention, minor leadership note) → +0.1 to +0.3
+
+---
+
+📉 NEGATIVE SIGNALS (Sentiment −0.4 to −1.0)
+
+Assign strong negative sentiment only when article **clearly implicates** {reference_firm} in:
+- Poor returns, redemptions, or investor dissatisfaction - Terrible returns should be seen as *MAX* negative (e.g., -0.8 to -1.0 sentiment)
+- Fines for misconduct, or serious regulatory action against the firm - also exceptionally negative for reputation
+- Target of successful, egregious lawsuits that seriously compromise {reference_firm}’s reputation
+- Mass layoffs, high-level departures, or executive instability/ feuds
+- Leadership scandals, egregious culture problems, or major new market credibility issues
+
+Soft negatives (e.g., listed in negative context, loss to rival) → −0.1 to −0.3
+Hard negatives (e.g., SEC fine, profit collapse) → −0.8 to −1.0, confidence ≥ 0.9
+
+---
+
+⚖️ LEGAL RULES
+
+- Filing a lawsuit or making an accusation → Neutral unless clearly praised or framed as very unusually strategic
+- Being sued or sanctioned → Negative only if major reputational harm is stated
+- Past lawsuits → Score only if framed as reputationally highly relevant today
+- If {reference_firm} is centrally involved as a plaintiff or complainant in a legal or regulatory dispute, and not accused of wrongdoing, note any evident reputational risk but avoid extreme negative scores. Suggested justification:
+”[firm] is involved as a plaintiff in a high-profile dispute over [issue], which may carry reputational and financial risks despite the firm not being accused of misconduct.”
+
+Examples:
+- “Jane Street sues Millennium” → Sentiment: 0.0 to +0.2
+- “Balyasny fined by SEC” → Sentiment: −0.8, Confidence: 0.8
+
+---
+
+🚫 NEVER ASSIGN SENTIMENT BASED ON:
+
+- Executive wealth or “rich lists”
+- Stock picks or 13-F filings
+- Praise for “quant funds” or traders without direct focus on {reference_firm}
+- Biographical trivia (e.g., “interned at Jane Street”)
+- VC activity unless tied to brand
+- Metaphors or vague comparisons (“the next Citadel”)
+- Alumni activity not tied to current culture or leadership
+
+---
+
+🧠 DISAGREEMENT ANALYSIS
+
+Check if the disagreement is due to:
+- One model falsely assuming {reference_firm} is the subject
+- Misinterpreting neutral information as reputational
+- Confusion over legal framing (plaintiff ≠ punished)
+
+If **both models miss the mark**, override them with a corrected score.
+
+---
+
+Title: {title}
+Summary: {summary}
