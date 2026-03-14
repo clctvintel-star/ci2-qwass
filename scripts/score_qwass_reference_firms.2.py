@@ -33,7 +33,7 @@ END = args.end
 
 INPUT_FILE = "/content/drive/MyDrive/CI2/db/qwass2/qwass_scoring_input.csv"
 OUTPUT_DIR = "/content/drive/MyDrive/CI2/db/qwass2"
-ENV_PATH = "/content/drive/MyDrive/CI2/ci2_keys.env"
+ENV_PATH = "ci2_keys.env"
 
 STAMP = datetime.now().strftime("%Y%m%d_%H%M")
 SLICE_TAG = f"{START}_{END if END is not None else 'end'}"
