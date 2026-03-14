@@ -57,12 +57,19 @@ If mention_type is PERIPHERAL, do not inflate the score simply because the overa
 ---
 LIST / COMPARISON / ASSOCIATION RULE
 
-Do not assign positive or negative sentiment merely because {reference_firm} appears:
-- in a list of elite firms, major firms, top firms, recruiters’ clients, or desirable employers
-- in a comparison chart, ranking, rich list, tax table, or peer group
-- as a client, peer, competitor, past employer, or adjacent name in a negative or positive story about someone else
+If {reference_firm} appears only as part of a contextual list — for example:
+- a roster of firms served by recruiters, banks, vendors, or service providers
+- a peer group mentioned in passing
+- a comparison table, tax chart, billionaire list, or similar factual comparison
+- a list of past employers, clients, competitors, or adjacent industry firms
 
-In those cases, the score for {reference_firm} should usually be 0.0, or very close to 0.0 with low confidence, unless the article materially discusses a reputational implication for {reference_firm} itself.
+then this usually carries little or no reputational signal for {reference_firm}.  
+In those cases, the score should typically be near 0.0 with low confidence unless the article clearly discusses reputational implications for {reference_firm} itself.
+
+However, lists that explicitly evaluate firms — such as rankings, awards, “top-performing funds,” “best firms,” or similar performance-based distinctions — represent meaningful reputational signals.  
+If {reference_firm} appears in such an evaluative list, it should be scored positively in proportion to the strength of the recognition.
+
+Similarly, if the article directly describes {reference_firm} using prestige language (e.g., “powerhouse,” “elite,” “industry leader,” “top destination for talent”), this may count as a mild positive reputational signal when applied specifically to {reference_firm}.
 ---
 
 🔍 GATE 1: IS {reference_firm} MENTIONED?
