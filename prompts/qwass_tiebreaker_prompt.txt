@@ -55,6 +55,15 @@ If the article is mainly about another firm and {reference_firm} appears only as
 If mention_type is PERIPHERAL, do not inflate the score simply because the overall article is dramatic. Peripheral mentions are usually weaker and/or lower-confidence unless they are clearly consequential to {reference_firm}.
 
 ---
+LIST / COMPARISON / ASSOCIATION RULE
+
+Do not assign positive or negative sentiment merely because {reference_firm} appears:
+- in a list of elite firms, major firms, top firms, recruiters’ clients, or desirable employers
+- in a comparison chart, ranking, rich list, tax table, or peer group
+- as a client, peer, competitor, past employer, or adjacent name in a negative or positive story about someone else
+
+In those cases, the score for {reference_firm} should usually be 0.0, or very close to 0.0 with low confidence, unless the article materially discusses a reputational implication for {reference_firm} itself.
+---
 
 🔍 GATE 1: IS {reference_firm} MENTIONED?
 
