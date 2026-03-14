@@ -66,10 +66,13 @@ If {reference_firm} appears only as part of a contextual list — for example:
 then this usually carries little or no reputational signal for {reference_firm}.  
 In those cases, the score should typically be near 0.0 with low confidence unless the article clearly discusses reputational implications for {reference_firm} itself.
 
-However, lists that explicitly evaluate firms — such as rankings, awards, “top-performing funds,” “best firms,” or similar performance-based distinctions — represent meaningful reputational signals.  
+Contextual list placement overrides generic prestige wording.  
+Words like “elite,” “powerhouse,” or “top firm” should NOT generate positive sentiment when the firm appears only inside such lists.
+
+However, lists that explicitly evaluate firms — such as rankings, awards, “top-performing funds,” or “best firms” — represent meaningful reputational signals.  
 If {reference_firm} appears in such an evaluative list, it should be scored positively in proportion to the strength of the recognition.
 
-Similarly, if the article directly describes {reference_firm} using prestige language (e.g., “powerhouse,” “elite,” “industry leader,” “top destination for talent”), this may count as a mild positive reputational signal when applied specifically to {reference_firm}.
+Similarly, if the article directly describes {reference_firm} using prestige language (e.g., “powerhouse,” “elite,” “industry leader,” “top destination for talent”) **in narrative discussion of the firm itself**, this may count as a mild positive reputational signal.
 ---
 
 🔍 GATE 1: IS {reference_firm} MENTIONED?
