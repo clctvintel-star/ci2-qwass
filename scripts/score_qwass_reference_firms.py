@@ -6,7 +6,7 @@ import os
 import re
 import time
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -449,7 +449,7 @@ def score_rows(df, openai_client, anthropic_client, google_client, existing_rows
             "final_confidence": final_confidence,
             "final_wass": final_wass,
             "theme_flags": theme_flags,
-            "scored_at": datetime.utcnow().isoformat(),
+            "scored_at": datetime.now(timezone.utc).isoformat(),
         }
 
         results.append(out_row)
