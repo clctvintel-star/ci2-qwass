@@ -15,7 +15,9 @@ paths_config = load_paths_config()
 drive_root = paths_config["ci2"]["drive_root"]
 qwass_db = paths_config["projects"]["qwass2"]["db"]
 
-CORPUS_PATH = f"{drive_root}/{qwass_db}/combined_ultra_raw.csv"
+from pathlib import Path
+
+CORPUS_PATH = str(Path(drive_root) / qwass_db / "combined_ultra_raw.csv")
 
 DEFAULT_BACKFILL_START = pd.Timestamp("2018-01-01")
 OVERLAP_DAYS = 7
