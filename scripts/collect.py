@@ -2,10 +2,20 @@ import os
 
 import pandas as pd
 
+import yaml
+
+def load_paths_config(path="config/paths.yaml"):
+    with open(path, "r") as f:
+        return yaml.safe_load(f)
+
 from query_helper import load_firms_config, build_discovery_queries
 
 
-CORPUS_PATH = "/content/drive/MyDrive/CI2/db/qwass2/combined_ultra_raw.csv"
+paths_config = load_paths_config()
+drive_root = paths_config["ci2"]["drive_root"]
+qwass_db = paths_config["projects"]["qwass2"]["db"]
+
+CORPUS_PATH = f"{drive_root}/{qwass_db}/combined_ultra_raw.csv"
 
 DEFAULT_BACKFILL_START = pd.Timestamp("2018-01-01")
 OVERLAP_DAYS = 7
