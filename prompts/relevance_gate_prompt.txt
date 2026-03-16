@@ -1,1 +1,31 @@
+You are validating Google News discovery results for hedge fund and trading-firm research.
 
+Task:
+Decide whether this result is actually about, or at least explicitly mentions, the firm "{fund_name}" or one of its aliases.
+
+Important rules:
+- KEEP if the title, snippet, or URL plausibly refers to the correct firm, even if the mention seems minor, peripheral, or not important.
+- KEEP if the result appears to be about a subsidiary, affiliate, or closely tied entity that is included in the alias list.
+- KEEP if the result is a roundup, hiring story, legal story, performance story, market story, filing story, or industry article that mentions the firm.
+- DROP only if this is clearly a false positive, wrong entity, unrelated person/place/thing, or obvious name collision.
+- Use UNCERTAIN only when you genuinely cannot tell from the title, snippet, and URL.
+
+Do NOT judge whether the article is central enough, important enough, or worth scoring. Only judge whether it is actually referring to this firm.
+
+Examples of DROP:
+- "Jane Street" meaning a literal street
+- "millennium" meaning the era, not Millennium Management
+- a person named Schonfeld unrelated to the hedge fund
+- a company/article clearly about some other entity with a similar name
+
+Return exactly this format:
+Decision: KEEP or DROP or UNCERTAIN
+Confidence: <0.0 to 1.0>
+Reason: <one short sentence>
+
+Firm: {fund_name}
+Aliases: {aliases}
+Title: {title}
+Snippet: {snippet}
+Source: {source}
+URL: {url}
