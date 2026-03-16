@@ -1,0 +1,675 @@
+import argparse
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
+
+import anthropic
+import pandas as pd
+import requests
+import trafilatura
+import yaml
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from newspaper import Article
+
+
+# =========================================================
+# CLI
+# =========================================================
+
+parser = argparse.ArgumentParser(description="CI2 QWASS enricher")
+parser.add_argument("--input", type=str, required=True, help="Path to collector append CSV")
+parser.add_argument("--output-dir", type=str, default=None, help="Directory for enriched outputs")
+parser.add_argument("--sleep-seconds", type=float, default=1.0, help="Delay between network calls")
+parser.add_argument("--llm-sleep-seconds", type=float, default=0.6, help="Delay between Claude relevance calls")
+parser.add_argument("--max-rows", type=int, default=None, help="Optional max rows for testing")
+args = parser.parse_args()
+
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+def load_yaml(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+
+PATHS = load_yaml("config/paths.yaml")
+FIRMS_CONFIG = load_yaml("config/firms.yaml")
+
+DRIVE_ROOT = PATHS["ci2"]["drive_root"]
+QWASS_DB = PATHS["projects"]["qwass2"]["db"]
+
+if "keys" in PATHS and "env_file" in PATHS["keys"]:
+    ENV_FILE_REL = PATHS["keys"]["env_file"]
+elif "paths" in PATHS and "keys_env" in PATHS["paths"]:
+    ENV_FILE_REL = PATHS["paths"]["keys_env"]
+else:
+    ENV_FILE_REL = "ci2_keys.env"
+
+ENV_PATH = (
+    Path(DRIVE_ROOT) / ENV_FILE_REL
+    if not str(ENV_FILE_REL).startswith("/content/")
+    else Path(ENV_FILE_REL)
+)
+
+INPUT_PATH = Path(args.input)
+STAMP = pd.Timestamp.now("UTC").strftime("%Y%m%d_%H%M%S")
+
+DEFAULT_OUTPUT_DIR = Path(args.output_dir) if args.output_dir else (Path(DRIVE_ROOT) / QWASS_DB)
+DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+ENRICHED_PATH = DEFAULT_OUTPUT_DIR / f"collector_enriched_{STAMP}.csv"
+MANUAL_QUEUE_PATH = DEFAULT_OUTPUT_DIR / f"collector_manual_queue_{STAMP}.csv"
+REPORT_PATH = DEFAULT_OUTPUT_DIR / f"collector_enrich_report_{STAMP}.json"
+
+CANONICAL_INPUT_COLUMNS = [
+    "article_id",
+    "date",
+    "time",
+    "utc",
+    "title",
+    "url",
+    "normalized_url",
+    "source",
+    "author1",
+    "author2",
+    "summary",
+    "summary_source",
+    "retrieved_snippet",
+    "snippet_engine",
+    "fund_name",
+    "collected_at",
+    "query_text",
+    "query_window_start",
+    "query_window_end",
+    "was_updated",
+]
+
+NEW_COLUMNS = [
+    "relevance_decision",
+    "relevance_confidence",
+    "relevance_reason",
+    "enrich_status",
+    "word_count",
+    "full_text_source",
+    "boilerplate_stripped",
+    "manual_review_flag",
+]
+
+OUTPUT_COLUMNS = CANONICAL_INPUT_COLUMNS + NEW_COLUMNS
+
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
+
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://news.google.com/",
+}
+
+MIN_WORDS_FORCE_ENRICH = 200
+MIN_WORDS_MAYBE_OK = 400
+MIN_WORDS_ARTICLE_GOOD = 250
+
+RELEVANCE_MODEL = "claude-3-5-haiku-latest"
+RELEVANCE_MAX_TOKENS = 180
+
+CLAUDE_RETRY_ATTEMPTS = 3
+REQUEST_TIMEOUT = 30
+
+BOILERPLATE_PATTERNS = [
+    r"subscribe now.*",
+    r"sign up for.*newsletter.*",
+    r"share this article.*",
+    r"follow us on .*",
+    r"all rights reserved.*",
+    r"copyright\s+\d{4}.*",
+    r"advertisement",
+    r"recommended stories.*",
+    r"read more:.*",
+    r"gift this article.*",
+    r"save article.*",
+    r"listen to this article.*",
+    r"create a free account.*",
+    r"already have an account\?.*",
+    r"to continue reading.*",
+    r"register now.*",
+    r"unlock this article.*",
+    r"explore more offers.*",
+    r"terms & conditions apply.*",
+    r"before it.?s here, it.?s on the bloomberg terminal.*",
+    r"make sense of the markets.*",
+    r"jump to comments.*",
+]
+
+MANUAL_REVIEW_DOMAINS = [
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "barrons.com",
+    "economist.com",
+]
+
+
+# =========================================================
+# ENV / CLIENTS
+# =========================================================
+
+def setup_env() -> anthropic.Anthropic:
+    if not ENV_PATH.exists():
+        raise FileNotFoundError(f"Missing env file: {ENV_PATH}")
+
+    load_dotenv(ENV_PATH)
+
+    anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not anthropic_api_key:
+        raise ValueError(f"ANTHROPIC_API_KEY not found in {ENV_PATH}")
+
+    return anthropic.Anthropic(api_key=anthropic_api_key)
+
+
+# =========================================================
+# FIRM ALIAS HELPERS
+# =========================================================
+
+def normalize_text(s: str) -> str:
+    return " ".join(str(s).strip().lower().split())
+
+
+def get_aliases_for_firm(fund_name: str) -> List[str]:
+    definitions = FIRMS_CONFIG.get("firm_definitions", {})
+    meta = definitions.get(fund_name, {})
+    aliases = [fund_name] + list(meta.get("aliases_safe", []))
+    aliases = [a.strip() for a in aliases if str(a).strip()]
+    deduped = []
+    seen = set()
+    for a in aliases:
+        key = normalize_text(a)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(a)
+    return deduped
+
+
+# =========================================================
+# LOAD / WORD COUNTS
+# =========================================================
+
+def ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    for col in CANONICAL_INPUT_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    for col in NEW_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+    return df
+
+
+def word_count(text: str) -> int:
+    if not isinstance(text, str):
+        return 0
+    return len(re.findall(r"\b\S+\b", text))
+
+
+def looks_like_substantial_text(text: str) -> bool:
+    wc = word_count(text)
+    return wc > MIN_WORDS_MAYBE_OK
+
+
+# =========================================================
+# CLAUDE RELEVANCE GATE
+# =========================================================
+
+def parse_relevance_response(text: str) -> Tuple[str, float, str]:
+    decision = "UNCERTAIN"
+    confidence = 0.5
+    reason = "[no reason]"
+
+    if not text:
+        return decision, confidence, reason
+
+    d_match = re.search(r"Decision:\s*(KEEP|DROP|UNCERTAIN)", text, flags=re.IGNORECASE)
+    c_match = re.search(r"Confidence:\s*([-+]?\d*\.?\d+)", text, flags=re.IGNORECASE)
+    r_match = re.search(r"Reason:\s*(.*)", text, flags=re.IGNORECASE | re.DOTALL)
+
+    if d_match:
+        decision = d_match.group(1).upper()
+    if c_match:
+        confidence = float(c_match.group(1))
+        confidence = max(0.0, min(1.0, confidence))
+    if r_match:
+        reason = r_match.group(1).strip()
+
+    return decision, confidence, reason
+
+
+def build_relevance_prompt(fund_name: str, aliases: List[str], title: str, snippet: str, source: str, url: str) -> str:
+    alias_text = ", ".join(aliases)
+
+    return f"""You are filtering Google News discovery results for hedge fund reputation research.
+
+Task:
+Decide whether this article is likely worth enriching for the fund "{fund_name}".
+
+Important:
+- Google News search results can be truncated.
+- The fund may be genuinely discussed in the article even if the snippet is incomplete.
+- Favor KEEP when the article is plausibly about the firm or clearly finance/business relevant and likely tied to the firm.
+- Use DROP only for obvious false positives, unrelated name collisions, or clearly irrelevant articles.
+- Use UNCERTAIN for ambiguous cases.
+
+Return exactly this format:
+Decision: KEEP or DROP or UNCERTAIN
+Confidence: <0.0 to 1.0>
+Reason: <one short sentence>
+
+Fund: {fund_name}
+Aliases: {alias_text}
+Title: {title}
+Snippet: {snippet}
+Source: {source}
+URL: {url}
+""".strip()
+
+
+def call_claude_relevance(
+    client: anthropic.Anthropic,
+    fund_name: str,
+    aliases: List[str],
+    title: str,
+    snippet: str,
+    source: str,
+    url: str,
+) -> Tuple[str, float, str]:
+    prompt = build_relevance_prompt(
+        fund_name=fund_name,
+        aliases=aliases,
+        title=title,
+        snippet=snippet,
+        source=source,
+        url=url,
+    )
+
+    last_error = None
+    for attempt in range(1, CLAUDE_RETRY_ATTEMPTS + 1):
+        try:
+            response = client.messages.create(
+                model=RELEVANCE_MODEL,
+                max_tokens=RELEVANCE_MAX_TOKENS,
+                temperature=0.0,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            parts = []
+            for block in response.content:
+                if getattr(block, "type", None) == "text":
+                    parts.append(block.text)
+            text = "\n".join(parts).strip()
+            return parse_relevance_response(text)
+        except Exception as e:
+            last_error = e
+            print(f"⚠️ Relevance gate attempt {attempt}/{CLAUDE_RETRY_ATTEMPTS} failed: {e}", flush=True)
+            time.sleep(2.5)
+
+    print(f"⚠️ Relevance gate fallback due to repeated failure: {last_error}", flush=True)
+    return "UNCERTAIN", 0.3, "Model call failed; defaulting to uncertain."
+
+
+# =========================================================
+# FETCH / EXTRACTION
+# =========================================================
+
+def fetch_html(url: str) -> Optional[str]:
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+        if resp.status_code == 200 and resp.text:
+            return resp.text
+    except Exception:
+        return None
+    return None
+
+
+def trafilatura_extract_from_url(url: str) -> str:
+    try:
+        downloaded = trafilatura.fetch_url(url)
+        if not downloaded:
+            return ""
+        text = trafilatura.extract(
+            downloaded,
+            include_comments=False,
+            include_links=False,
+            favor_precision=True,
+            deduplicate=True,
+        )
+        return (text or "").strip()
+    except Exception:
+        return ""
+
+
+def trafilatura_extract_from_html(html_text: str) -> str:
+    try:
+        text = trafilatura.extract(
+            html_text,
+            include_comments=False,
+            include_links=False,
+            favor_precision=True,
+            deduplicate=True,
+        )
+        return (text or "").strip()
+    except Exception:
+        return ""
+
+
+def newspaper_extract(url: str, html_text: Optional[str] = None) -> str:
+    try:
+        art = Article(url, language="en")
+        if html_text:
+            art.set_html(html_text)
+            art.parse()
+        else:
+            art.download()
+            art.parse()
+        return (art.text or "").strip()
+    except Exception:
+        return ""
+
+
+def wayback_url(url: str) -> str:
+    return f"https://web.archive.org/web/0/{quote(url, safe=':/?&=%')}"
+
+
+def get_domain(url: str) -> str:
+    m = re.search(r"https?://([^/]+)", str(url).strip().lower())
+    return m.group(1).replace("www.", "") if m else ""
+
+
+# =========================================================
+# CLEANUP
+# =========================================================
+
+def clean_html_to_text(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside", "form"]):
+        tag.decompose()
+    text = soup.get_text("\n")
+    text = re.sub(r"\n{2,}", "\n\n", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    return text.strip()
+
+
+def strip_boilerplate(text: str) -> Tuple[str, bool]:
+    if not text:
+        return "", False
+
+    original = text
+    cleaned = text
+
+    for pattern in BOILERPLATE_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+
+    lines = [ln.strip() for ln in cleaned.splitlines()]
+    filtered = []
+    for ln in lines:
+        if not ln:
+            continue
+        if len(ln.split()) <= 2 and ln.lower() in {"share", "subscribe", "advertisement", "newsletter"}:
+            continue
+        filtered.append(ln)
+
+    cleaned = "\n".join(filtered)
+    cleaned = re.sub(r"\n{2,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned).strip()
+
+    changed = cleaned != original
+    return cleaned, changed
+
+
+def maybe_existing_text_good(text: str) -> bool:
+    wc = word_count(text)
+    return wc > MIN_WORDS_MAYBE_OK
+
+
+# =========================================================
+# ENRICHMENT CORE
+# =========================================================
+
+def try_extract_full_text(url: str) -> Tuple[str, str]:
+    # 1) direct trafilatura from URL
+    text = trafilatura_extract_from_url(url)
+    if word_count(text) >= MIN_WORDS_ARTICLE_GOOD:
+        return text, "trafilatura"
+
+    # 2) fetch HTML then trafilatura/newspaper
+    html_text = fetch_html(url)
+    if html_text:
+        text2 = trafilatura_extract_from_html(html_text)
+        if word_count(text2) >= MIN_WORDS_ARTICLE_GOOD:
+            return text2, "trafilatura_html"
+
+        text3 = newspaper_extract(url, html_text=html_text)
+        if word_count(text3) >= MIN_WORDS_ARTICLE_GOOD:
+            return text3, "newspaper_html"
+
+        text4 = clean_html_to_text(html_text)
+        if word_count(text4) >= MIN_WORDS_ARTICLE_GOOD:
+            return text4, "raw_html_text"
+
+    # 3) direct newspaper
+    text5 = newspaper_extract(url)
+    if word_count(text5) >= MIN_WORDS_ARTICLE_GOOD:
+        return text5, "newspaper"
+
+    # 4) wayback fallback
+    wb_url = wayback_url(url)
+    text6 = trafilatura_extract_from_url(wb_url)
+    if word_count(text6) >= MIN_WORDS_ARTICLE_GOOD:
+        return text6, "wayback_trafilatura"
+
+    wb_html = fetch_html(wb_url)
+    if wb_html:
+        text7 = trafilatura_extract_from_html(wb_html)
+        if word_count(text7) >= MIN_WORDS_ARTICLE_GOOD:
+            return text7, "wayback_trafilatura_html"
+
+        text8 = newspaper_extract(wb_url, html_text=wb_html)
+        if word_count(text8) >= MIN_WORDS_ARTICLE_GOOD:
+            return text8, "wayback_newspaper_html"
+
+    return "", ""
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    client = setup_env()
+
+    if not INPUT_PATH.exists():
+        raise FileNotFoundError(f"Input file not found: {INPUT_PATH}")
+
+    df = pd.read_csv(INPUT_PATH)
+    df = ensure_columns(df)
+
+    if args.max_rows is not None:
+        df = df.head(args.max_rows).copy()
+
+    rows_loaded = len(df)
+    print(f"✅ Loaded append rows: {rows_loaded}", flush=True)
+    print(f"Input:  {INPUT_PATH}", flush=True)
+    print(f"Output: {ENRICHED_PATH}", flush=True)
+
+    enriched_rows: List[Dict] = []
+    manual_rows: List[Dict] = []
+
+    report = {
+        "created_at_utc": pd.Timestamp.now("UTC").isoformat(),
+        "input_file": str(INPUT_PATH),
+        "enriched_file": str(ENRICHED_PATH),
+        "manual_queue_file": str(MANUAL_QUEUE_PATH),
+        "rows_loaded": rows_loaded,
+        "relevance_counts": {"KEEP": 0, "DROP": 0, "UNCERTAIN": 0},
+        "status_counts": {},
+    }
+
+    for idx, row in df.iterrows():
+        out = row.to_dict()
+        fund_name = str(out.get("fund_name", "")).strip()
+        aliases = get_aliases_for_firm(fund_name)
+
+        title = str(out.get("title", "") or "").strip()
+        snippet = str(out.get("summary", "") or "").strip()
+        source = str(out.get("source", "") or "").strip()
+        url = str(out.get("url", "") or "").strip()
+
+        existing_wc = word_count(snippet)
+
+        decision, confidence, reason = call_claude_relevance(
+            client=client,
+            fund_name=fund_name,
+            aliases=aliases,
+            title=title,
+            snippet=snippet,
+            source=source,
+            url=url,
+        )
+
+        out["relevance_decision"] = decision
+        out["relevance_confidence"] = confidence
+        out["relevance_reason"] = reason
+
+        report["relevance_counts"][decision] = report["relevance_counts"].get(decision, 0) + 1
+
+        if decision == "DROP":
+            out["enrich_status"] = "dropped_relevance_gate"
+            out["word_count"] = existing_wc
+            out["full_text_source"] = ""
+            out["boilerplate_stripped"] = False
+            out["manual_review_flag"] = False
+            enriched_rows.append(out)
+            print(f"🗑️ DROP [{idx+1}/{rows_loaded}] {title[:90]}", flush=True)
+            time.sleep(args.llm_sleep_seconds)
+            continue
+
+        if maybe_existing_text_good(snippet):
+            cleaned, changed = strip_boilerplate(snippet)
+            out["summary"] = cleaned
+            out["summary_source"] = out.get("summary_source") or "existing"
+            out["retrieved_snippet"] = out.get("retrieved_snippet") or ""
+            out["snippet_engine"] = out.get("snippet_engine") or ""
+            out["was_updated"] = bool(changed)
+            out["enrich_status"] = "kept_existing_long_text"
+            out["word_count"] = word_count(cleaned)
+            out["full_text_source"] = "existing_summary"
+            out["boilerplate_stripped"] = changed
+            out["manual_review_flag"] = False
+            enriched_rows.append(out)
+            print(f"✅ KEEP EXISTING [{idx+1}/{rows_loaded}] wc={out['word_count']} | {title[:90]}", flush=True)
+            time.sleep(args.llm_sleep_seconds)
+            continue
+
+        text, source_label = try_extract_full_text(url)
+
+        if text:
+            cleaned, changed = strip_boilerplate(text)
+            out["summary"] = cleaned
+            out["summary_source"] = source_label
+            out["retrieved_snippet"] = ""
+            out["snippet_engine"] = source_label
+            out["was_updated"] = True
+            out["enrich_status"] = f"success_{source_label}"
+            out["word_count"] = word_count(cleaned)
+            out["full_text_source"] = source_label
+            out["boilerplate_stripped"] = changed
+            out["manual_review_flag"] = False
+            enriched_rows.append(out)
+            print(f"✅ ENRICHED [{idx+1}/{rows_loaded}] {source_label} wc={out['word_count']} | {title[:90]}", flush=True)
+        else:
+            domain = get_domain(url)
+            manual_flag = True
+
+            out["enrich_status"] = "manual_review_needed"
+            out["word_count"] = existing_wc
+            out["full_text_source"] = ""
+            out["boilerplate_stripped"] = False
+            out["manual_review_flag"] = manual_flag
+
+            if not snippet:
+                out["summary"] = ""
+
+            enriched_rows.append(out)
+
+            manual_row = {
+                "article_id": out.get("article_id", ""),
+                "fund_name": fund_name,
+                "title": title,
+                "url": url,
+                "source": source,
+                "summary": snippet,
+                "relevance_decision": decision,
+                "relevance_confidence": confidence,
+                "relevance_reason": reason,
+                "enrich_status": "manual_review_needed",
+                "domain": domain,
+                "hard_domain_flag": domain in MANUAL_REVIEW_DOMAINS,
+            }
+            manual_rows.append(manual_row)
+
+            print(f"⚠️ MANUAL [{idx+1}/{rows_loaded}] {domain} | {title[:90]}", flush=True)
+
+        time.sleep(args.sleep_seconds)
+
+    enriched_df = pd.DataFrame(enriched_rows)
+    enriched_df = ensure_columns(enriched_df)
+    enriched_df = enriched_df.reindex(columns=OUTPUT_COLUMNS)
+
+    manual_df = pd.DataFrame(manual_rows)
+
+    status_counts = enriched_df["enrich_status"].fillna("").astype(str).value_counts().to_dict()
+    report["status_counts"] = status_counts
+    report["manual_queue_count"] = len(manual_df)
+
+    enriched_df.to_csv(ENRICHED_PATH, index=False)
+    if len(manual_df) > 0:
+        manual_df.to_csv(MANUAL_QUEUE_PATH, index=False)
+    else:
+        pd.DataFrame(columns=[
+            "article_id",
+            "fund_name",
+            "title",
+            "url",
+            "source",
+            "summary",
+            "relevance_decision",
+            "relevance_confidence",
+            "relevance_reason",
+            "enrich_status",
+            "domain",
+            "hard_domain_flag",
+        ]).to_csv(MANUAL_QUEUE_PATH, index=False)
+
+    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+
+    print("\n=== ENRICHMENT SUMMARY ===", flush=True)
+    print(f"Rows loaded:          {rows_loaded}", flush=True)
+    print(f"KEEP:                 {report['relevance_counts'].get('KEEP', 0)}", flush=True)
+    print(f"DROP:                 {report['relevance_counts'].get('DROP', 0)}", flush=True)
+    print(f"UNCERTAIN:            {report['relevance_counts'].get('UNCERTAIN', 0)}", flush=True)
+    print(f"Manual queue count:   {len(manual_df)}", flush=True)
+    print(f"Saved enriched file:  {ENRICHED_PATH}", flush=True)
+    print(f"Saved manual queue:   {MANUAL_QUEUE_PATH}", flush=True)
+    print(f"Saved report:         {REPORT_PATH}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
