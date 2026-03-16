@@ -128,10 +128,6 @@ HEADERS = {
     "Referer": "https://news.google.com/",
 }
 
-# User logic:
-# <150 words -> too short
-# 150-349 -> partial / ambiguous
-# >=350 -> strong enough to accept
 MIN_WORDS_CLEAR_FAILURE = 150
 MIN_WORDS_PARTIAL = 350
 MIN_WORDS_STRONG_SUCCESS = 350
@@ -141,6 +137,10 @@ RELEVANCE_MAX_TOKENS = 180
 
 CLAUDE_RETRY_ATTEMPTS = 3
 REQUEST_TIMEOUT = 30
+
+EXTRACTOR_RETRIES = 3
+EXTRACTOR_SLEEP_SECONDS = 1.0
+MIN_RETRY_ACCEPT_WORDS = 20
 
 BOILERPLATE_PATTERNS = [
     r"subscribe now.*",
@@ -180,6 +180,21 @@ MANUAL_REVIEW_DOMAINS = [
     "barrons.com",
     "economist.com",
 ]
+
+LOW_QUALITY_SOURCE_PENALTIES = {
+    "raw_html_text": 35,
+    "wayback_raw_html_text": 45,
+    "wayback_trafilatura": 10,
+    "wayback_trafilatura_html": 8,
+    "wayback_newspaper_html": 8,
+}
+
+SOURCE_BONUSES = {
+    "trafilatura_html": 8,
+    "newspaper_html": 6,
+    "trafilatura": 5,
+    "newspaper": 3,
+}
 
 
 # =========================================================
@@ -472,49 +487,93 @@ def strip_boilerplate(text: str) -> Tuple[str, bool]:
 # EXTRACTION CORE
 # =========================================================
 
-def try_extract_full_text(url: str) -> Tuple[str, str]:
-    # 1) direct trafilatura from URL
-    text = trafilatura_extract_from_url(url)
-    if text:
-        return text, "trafilatura"
+def retry_extract(func, *args):
+    last_text = ""
+    for _ in range(EXTRACTOR_RETRIES):
+        try:
+            text = func(*args)
+            if text and word_count(text) >= MIN_RETRY_ACCEPT_WORDS:
+                return text
+            last_text = text or ""
+        except Exception:
+            pass
+        time.sleep(EXTRACTOR_SLEEP_SECONDS)
+    return last_text or ""
 
-    # 2) fetch HTML then trafilatura/newspaper/raw
-    html_text = fetch_html(url)
+
+def add_candidate(candidates: List[Dict], text: str, source_label: str):
+    if not text:
+        return
+
+    cleaned, changed = strip_boilerplate(text)
+    wc = word_count(cleaned)
+
+    if wc == 0:
+        return
+
+    score = wc
+    score -= LOW_QUALITY_SOURCE_PENALTIES.get(source_label, 0)
+    score += SOURCE_BONUSES.get(source_label, 0)
+
+    candidates.append({
+        "text": cleaned,
+        "source": source_label,
+        "word_count": wc,
+        "boilerplate_stripped": changed,
+        "score": score,
+    })
+
+
+def choose_best_candidate(candidates: List[Dict]) -> Tuple[str, str, bool]:
+    if not candidates:
+        return "", "", False
+
+    candidates = sorted(
+        candidates,
+        key=lambda x: (x["score"], x["word_count"]),
+        reverse=True
+    )
+    best = candidates[0]
+    return best["text"], best["source"], bool(best["boilerplate_stripped"])
+
+
+def try_extract_full_text(url: str) -> Tuple[str, str, bool]:
+    candidates: List[Dict] = []
+
+    text1 = retry_extract(trafilatura_extract_from_url, url)
+    add_candidate(candidates, text1, "trafilatura")
+
+    html_text = retry_extract(fetch_html, url)
     if html_text:
-        text2 = trafilatura_extract_from_html(html_text)
-        if text2:
-            return text2, "trafilatura_html"
+        text2 = retry_extract(trafilatura_extract_from_html, html_text)
+        add_candidate(candidates, text2, "trafilatura_html")
 
-        text3 = newspaper_extract(url, html_text=html_text)
-        if text3:
-            return text3, "newspaper_html"
+        text3 = retry_extract(newspaper_extract, url, html_text)
+        add_candidate(candidates, text3, "newspaper_html")
 
         text4 = clean_html_to_text(html_text)
-        if text4:
-            return text4, "raw_html_text"
+        add_candidate(candidates, text4, "raw_html_text")
 
-    # 3) direct newspaper
-    text5 = newspaper_extract(url)
-    if text5:
-        return text5, "newspaper"
+    text5 = retry_extract(newspaper_extract, url)
+    add_candidate(candidates, text5, "newspaper")
 
-    # 4) wayback fallback
     wb_url = wayback_url(url)
-    text6 = trafilatura_extract_from_url(wb_url)
-    if text6:
-        return text6, "wayback_trafilatura"
 
-    wb_html = fetch_html(wb_url)
+    text6 = retry_extract(trafilatura_extract_from_url, wb_url)
+    add_candidate(candidates, text6, "wayback_trafilatura")
+
+    wb_html = retry_extract(fetch_html, wb_url)
     if wb_html:
-        text7 = trafilatura_extract_from_html(wb_html)
-        if text7:
-            return text7, "wayback_trafilatura_html"
+        text7 = retry_extract(trafilatura_extract_from_html, wb_html)
+        add_candidate(candidates, text7, "wayback_trafilatura_html")
 
-        text8 = newspaper_extract(wb_url, html_text=wb_html)
-        if text8:
-            return text8, "wayback_newspaper_html"
+        text8 = retry_extract(newspaper_extract, wb_url, wb_html)
+        add_candidate(candidates, text8, "wayback_newspaper_html")
 
-    return "", ""
+        text9 = clean_html_to_text(wb_html)
+        add_candidate(candidates, text9, "wayback_raw_html_text")
+
+    return choose_best_candidate(candidates)
 
 
 # =========================================================
@@ -633,21 +692,20 @@ def main():
             time.sleep(args.llm_sleep_seconds)
             continue
 
-        text, source_label = try_extract_full_text(url)
+        text, source_label, stripped_flag = try_extract_full_text(url)
 
         if text:
-            cleaned, changed = strip_boilerplate(text)
-            cleaned_wc = word_count(cleaned)
+            cleaned_wc = word_count(text)
             strength = classify_text_length(cleaned_wc)
 
-            out["summary"] = cleaned
+            out["summary"] = text
             out["summary_source"] = source_label
             out["retrieved_snippet"] = ""
             out["snippet_engine"] = source_label
             out["was_updated"] = True
             out["word_count"] = cleaned_wc
             out["full_text_source"] = source_label
-            out["boilerplate_stripped"] = changed
+            out["boilerplate_stripped"] = stripped_flag
 
             if strength == "strong":
                 out["enrich_status"] = f"success_{source_label}"
