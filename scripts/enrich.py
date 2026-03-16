@@ -126,6 +126,8 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Referer": "https://news.google.com/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 MIN_WORDS_CLEAR_FAILURE = 150
@@ -139,8 +141,18 @@ CLAUDE_RETRY_ATTEMPTS = 3
 REQUEST_TIMEOUT = 30
 
 EXTRACTOR_RETRIES = 3
-EXTRACTOR_SLEEP_SECONDS = 1.0
+EXTRACTOR_SLEEP_SECONDS = 1.25
 MIN_RETRY_ACCEPT_WORDS = 20
+
+ARCHIVE_MIRRORS = [
+    "archive.ph",
+    "archive.is",
+    "archive.today",
+    "archive.fo",
+    "archive.li",
+    "archive.md",
+    "archive.vn",
+]
 
 BOILERPLATE_PATTERNS = [
     r"subscribe now.*",
@@ -182,18 +194,24 @@ MANUAL_REVIEW_DOMAINS = [
 ]
 
 LOW_QUALITY_SOURCE_PENALTIES = {
-    "raw_html_text": 35,
-    "wayback_raw_html_text": 45,
-    "wayback_trafilatura": 10,
-    "wayback_trafilatura_html": 8,
-    "wayback_newspaper_html": 8,
+    "raw_html_text": 40,
+    "wayback_raw_html_text": 50,
+    "archive_raw_html_text": 50,
+    "trafilatura_url": 5,
+    "wayback_trafilatura_url": 12,
+    "archive_trafilatura_url": 12,
 }
 
 SOURCE_BONUSES = {
-    "trafilatura_html": 8,
-    "newspaper_html": 6,
-    "trafilatura": 5,
-    "newspaper": 3,
+    "trafilatura_html": 10,
+    "newspaper_html": 7,
+    "json_ld_articlebody": 9,
+    "archive_trafilatura_html": 10,
+    "archive_newspaper_html": 7,
+    "wayback_trafilatura_html": 8,
+    "wayback_newspaper_html": 6,
+    "trafilatura_url": 4,
+    "newspaper_url": 2,
 }
 
 
@@ -372,8 +390,13 @@ def call_claude_relevance(
 
 
 # =========================================================
-# FETCH / EXTRACTION
+# FETCH / EXTRACTION HELPERS
 # =========================================================
+
+def get_domain(url: str) -> str:
+    m = re.search(r"https?://([^/]+)", str(url).strip().lower())
+    return m.group(1).replace("www.", "") if m else ""
+
 
 def fetch_html(url: str) -> Optional[str]:
     try:
@@ -383,6 +406,26 @@ def fetch_html(url: str) -> Optional[str]:
     except Exception:
         return None
     return None
+
+
+def resolve_redirect(url: str) -> str:
+    if not url:
+        return url
+
+    for method in ("head", "get"):
+        try:
+            if method == "head":
+                resp = requests.head(url, headers=HEADERS, timeout=12, allow_redirects=True)
+            else:
+                resp = requests.get(url, headers=HEADERS, timeout=12, allow_redirects=True, stream=True)
+
+            final_url = str(getattr(resp, "url", "") or "").strip()
+            if final_url:
+                return final_url
+        except Exception:
+            continue
+
+    return url
 
 
 def trafilatura_extract_from_url(url: str) -> str:
@@ -434,13 +477,44 @@ def wayback_url(url: str) -> str:
     return f"https://web.archive.org/web/0/{quote(url, safe=':/?&=%')}"
 
 
-def get_domain(url: str) -> str:
-    m = re.search(r"https?://([^/]+)", str(url).strip().lower())
-    return m.group(1).replace("www.", "") if m else ""
+def lookup_archive_snapshot(url: str) -> Optional[str]:
+    original = url.strip()
+    if not original:
+        return None
+
+    snapshot_patterns = [
+        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/[A-Za-z0-9]+',
+        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/o/[A-Za-z0-9]+',
+    ]
+
+    for domain in ARCHIVE_MIRRORS:
+        lookup_urls = [
+            f"https://{domain}/{original}",
+            f"https://{domain}/?run=1&url={quote(original, safe='')}",
+            f"https://{domain}/?url={quote(original, safe='')}",
+        ]
+
+        for lookup_url in lookup_urls:
+            try:
+                resp = requests.get(lookup_url, headers=HEADERS, timeout=15, allow_redirects=True)
+                final_url = str(getattr(resp, "url", "") or "").strip()
+                html = resp.text or ""
+
+                if re.search(rf"https?://{re.escape(domain)}/[A-Za-z0-9]+$", final_url):
+                    return final_url
+
+                for pattern in snapshot_patterns:
+                    m = re.search(pattern, html)
+                    if m:
+                        return m.group(0)
+            except Exception:
+                continue
+
+    return None
 
 
 # =========================================================
-# CLEANUP
+# CLEANUP / EXTRA TEXT SOURCES
 # =========================================================
 
 def clean_html_to_text(html_text: str) -> str:
@@ -451,6 +525,44 @@ def clean_html_to_text(html_text: str) -> str:
     text = re.sub(r"\n{2,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
+
+
+def extract_json_ld_articlebody(html_text: str) -> str:
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        bodies = []
+
+        for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            raw = tag.string or tag.get_text() or ""
+            raw = raw.strip()
+            if not raw:
+                continue
+
+            try:
+                data = json.loads(raw)
+            except Exception:
+                continue
+
+            stack = [data]
+            while stack:
+                item = stack.pop()
+                if isinstance(item, dict):
+                    article_body = item.get("articleBody")
+                    if isinstance(article_body, str) and article_body.strip():
+                        bodies.append(article_body.strip())
+                    for value in item.values():
+                        if isinstance(value, (dict, list)):
+                            stack.append(value)
+                elif isinstance(item, list):
+                    stack.extend(item)
+
+        if not bodies:
+            return ""
+
+        best = max(bodies, key=word_count)
+        return best.strip()
+    except Exception:
+        return ""
 
 
 def strip_boilerplate(text: str) -> Tuple[str, bool]:
@@ -489,7 +601,7 @@ def strip_boilerplate(text: str) -> Tuple[str, bool]:
 
 def retry_extract(func, *args):
     last_text = ""
-    for _ in range(EXTRACTOR_RETRIES):
+    for attempt in range(EXTRACTOR_RETRIES):
         try:
             text = func(*args)
             if text and word_count(text) >= MIN_RETRY_ACCEPT_WORDS:
@@ -497,7 +609,7 @@ def retry_extract(func, *args):
             last_text = text or ""
         except Exception:
             pass
-        time.sleep(EXTRACTOR_SLEEP_SECONDS)
+        time.sleep(EXTRACTOR_SLEEP_SECONDS * (attempt + 1))
     return last_text or ""
 
 
@@ -511,9 +623,19 @@ def add_candidate(candidates: List[Dict], text: str, source_label: str):
     if wc == 0:
         return
 
-    score = wc
-    score -= LOW_QUALITY_SOURCE_PENALTIES.get(source_label, 0)
-    score += SOURCE_BONUSES.get(source_label, 0)
+    line_count = len([ln for ln in cleaned.splitlines() if ln.strip()])
+    avg_line_words = (wc / line_count) if line_count else wc
+    short_line_penalty = 0
+
+    if avg_line_words < 5:
+        short_line_penalty += 45
+    elif avg_line_words < 8:
+        short_line_penalty += 20
+
+    source_penalty = LOW_QUALITY_SOURCE_PENALTIES.get(source_label, 0)
+    source_bonus = SOURCE_BONUSES.get(source_label, 0)
+
+    score = wc - source_penalty - short_line_penalty + source_bonus
 
     candidates.append({
         "text": cleaned,
@@ -540,28 +662,32 @@ def choose_best_candidate(candidates: List[Dict]) -> Tuple[str, str, bool]:
 def try_extract_full_text(url: str) -> Tuple[str, str, bool]:
     candidates: List[Dict] = []
 
-    text1 = retry_extract(trafilatura_extract_from_url, url)
-    add_candidate(candidates, text1, "trafilatura")
+    canonical_url = resolve_redirect(url)
 
-    html_text = retry_extract(fetch_html, url)
+    # 1) HTML-first on canonical URL
+    html_text = retry_extract(fetch_html, canonical_url)
     if html_text:
-        text2 = retry_extract(trafilatura_extract_from_html, html_text)
-        add_candidate(candidates, text2, "trafilatura_html")
+        text1 = retry_extract(trafilatura_extract_from_html, html_text)
+        add_candidate(candidates, text1, "trafilatura_html")
 
-        text3 = retry_extract(newspaper_extract, url, html_text)
-        add_candidate(candidates, text3, "newspaper_html")
+        text2 = retry_extract(newspaper_extract, canonical_url, html_text)
+        add_candidate(candidates, text2, "newspaper_html")
+
+        text3 = retry_extract(extract_json_ld_articlebody, html_text)
+        add_candidate(candidates, text3, "json_ld_articlebody")
 
         text4 = clean_html_to_text(html_text)
         add_candidate(candidates, text4, "raw_html_text")
 
-    text5 = retry_extract(newspaper_extract, url)
-    add_candidate(candidates, text5, "newspaper")
+    # 2) URL-based extraction on canonical URL
+    text5 = retry_extract(trafilatura_extract_from_url, canonical_url)
+    add_candidate(candidates, text5, "trafilatura_url")
 
-    wb_url = wayback_url(url)
+    text6 = retry_extract(newspaper_extract, canonical_url)
+    add_candidate(candidates, text6, "newspaper_url")
 
-    text6 = retry_extract(trafilatura_extract_from_url, wb_url)
-    add_candidate(candidates, text6, "wayback_trafilatura")
-
+    # 3) Wayback fallback
+    wb_url = wayback_url(canonical_url)
     wb_html = retry_extract(fetch_html, wb_url)
     if wb_html:
         text7 = retry_extract(trafilatura_extract_from_html, wb_html)
@@ -570,8 +696,34 @@ def try_extract_full_text(url: str) -> Tuple[str, str, bool]:
         text8 = retry_extract(newspaper_extract, wb_url, wb_html)
         add_candidate(candidates, text8, "wayback_newspaper_html")
 
-        text9 = clean_html_to_text(wb_html)
-        add_candidate(candidates, text9, "wayback_raw_html_text")
+        text9 = retry_extract(extract_json_ld_articlebody, wb_html)
+        add_candidate(candidates, text9, "wayback_json_ld_articlebody")
+
+        text10 = clean_html_to_text(wb_html)
+        add_candidate(candidates, text10, "wayback_raw_html_text")
+
+    text11 = retry_extract(trafilatura_extract_from_url, wb_url)
+    add_candidate(candidates, text11, "wayback_trafilatura_url")
+
+    # 4) archive.ph / mirrors fallback
+    archive_url = lookup_archive_snapshot(canonical_url)
+    if archive_url:
+        archive_html = retry_extract(fetch_html, archive_url)
+        if archive_html:
+            text12 = retry_extract(trafilatura_extract_from_html, archive_html)
+            add_candidate(candidates, text12, "archive_trafilatura_html")
+
+            text13 = retry_extract(newspaper_extract, archive_url, archive_html)
+            add_candidate(candidates, text13, "archive_newspaper_html")
+
+            text14 = retry_extract(extract_json_ld_articlebody, archive_html)
+            add_candidate(candidates, text14, "archive_json_ld_articlebody")
+
+            text15 = clean_html_to_text(archive_html)
+            add_candidate(candidates, text15, "archive_raw_html_text")
+
+        text16 = retry_extract(trafilatura_extract_from_url, archive_url)
+        add_candidate(candidates, text16, "archive_trafilatura_url")
 
     return choose_best_candidate(candidates)
 
