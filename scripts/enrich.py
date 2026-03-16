@@ -124,9 +124,9 @@ HEADERS = {
 # <200 words -> likely just summary / too short
 # 200-400 -> ambiguous / often still not good enough
 # >400 -> probably full article or close enough
-MIN_WORDS_CLEAR_FAILURE = 200
-MIN_WORDS_PARTIAL = 400
-MIN_WORDS_STRONG_SUCCESS = 400
+MIN_WORDS_CLEAR_FAILURE = 150
+MIN_WORDS_PARTIAL = 350
+MIN_WORDS_STRONG_SUCCESS = 350
 
 RELEVANCE_MODEL = "claude-haiku-4-5"
 RELEVANCE_MAX_TOKENS = 180
