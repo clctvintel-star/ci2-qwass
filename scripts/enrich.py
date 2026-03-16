@@ -24,8 +24,8 @@ from newspaper import Article
 parser = argparse.ArgumentParser(description="CI2 QWASS enricher")
 parser.add_argument("--input", type=str, required=True, help="Path to collector append CSV")
 parser.add_argument("--output-dir", type=str, default=None, help="Directory for enriched outputs")
-parser.add_argument("--sleep-seconds", type=float, default=1.0, help="Delay between network calls")
-parser.add_argument("--llm-sleep-seconds", type=float, default=0.4, help="Delay between Claude relevance calls")
+parser.add_argument("--sleep-seconds", type=float, default=0.8, help="Delay between network calls")
+parser.add_argument("--llm-sleep-seconds", type=float, default=0.25, help="Delay between relevance calls")
 parser.add_argument("--max-rows", type=int, default=None, help="Optional max rows for testing")
 args = parser.parse_args()
 
@@ -51,7 +51,37 @@ def load_text(path: Path) -> str:
 
 PATHS = load_yaml("config/paths.yaml")
 FIRMS_CONFIG = load_yaml("config/firms.yaml")
-RELEVANCE_PROMPT_TEMPLATE = load_text(PROMPTS_DIR / "relevance_gate_prompt.txt")
+
+RELEVANCE_PROMPT_PATH = PROMPTS_DIR / "relevance_gate_prompt.txt"
+if RELEVANCE_PROMPT_PATH.exists():
+    RELEVANCE_PROMPT_TEMPLATE = load_text(RELEVANCE_PROMPT_PATH)
+else:
+    RELEVANCE_PROMPT_TEMPLATE = """
+You are deciding whether an article is relevant to a tracked hedge fund / trading firm.
+
+Tracked firm: {fund_name}
+Known aliases: {aliases}
+
+Title: {title}
+Snippet: {snippet}
+Source: {source}
+URL: {url}
+
+Rules:
+- KEEP if the tracked firm is directly mentioned, even briefly.
+- KEEP if the story is about someone joining from, leaving from, being hired from, or being poached from the tracked firm.
+- KEEP if the tracked firm is compared to peers on performance, talent, strategy, fees, culture, regulation, litigation, technology, crypto, AI, market making, or recruiting.
+- KEEP if the tracked firm is mentioned as a former employer and that fact is meaningful to the story.
+- KEEP if there is any plausible reputational relevance to allocators, job candidates, reporters, PR/comms, or rivals.
+- DROP only if the article is clearly not about the tracked firm at all.
+- When uncertain, choose KEEP or UNCERTAIN, not DROP.
+
+Return exactly:
+
+Decision: KEEP or DROP or UNCERTAIN
+Confidence: <0.0 to 1.0>
+Reason: <brief reason>
+""".strip()
 
 DRIVE_ROOT = PATHS["ci2"]["drive_root"]
 QWASS_DB = PATHS["projects"]["qwass2"]["db"]
@@ -111,6 +141,7 @@ NEW_COLUMNS = [
     "full_text_source",
     "boilerplate_stripped",
     "manual_review_flag",
+    "archive_snapshot_url",
 ]
 
 OUTPUT_COLUMNS = CANONICAL_INPUT_COLUMNS + NEW_COLUMNS
@@ -135,14 +166,17 @@ MIN_WORDS_PARTIAL = 350
 MIN_WORDS_STRONG_SUCCESS = 350
 
 RELEVANCE_MODEL = "claude-haiku-4-5"
-RELEVANCE_MAX_TOKENS = 180
+RELEVANCE_MAX_TOKENS = 220
 
 CLAUDE_RETRY_ATTEMPTS = 3
 REQUEST_TIMEOUT = 30
 
 EXTRACTOR_RETRIES = 3
-EXTRACTOR_SLEEP_SECONDS = 1.25
+EXTRACTOR_SLEEP_SECONDS = 1.2
 MIN_RETRY_ACCEPT_WORDS = 20
+
+# Very conservative drop threshold
+DROP_CONFIDENCE_THRESHOLD = 0.93
 
 ARCHIVE_MIRRORS = [
     "archive.ph",
@@ -152,6 +186,24 @@ ARCHIVE_MIRRORS = [
     "archive.li",
     "archive.md",
     "archive.vn",
+]
+
+PAYWALL_PRIORITY_DOMAINS = [
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "barrons.com",
+    "economist.com",
+    "markets.businessinsider.com",
+    "businessinsider.com",
+]
+
+MANUAL_REVIEW_DOMAINS = [
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "barrons.com",
+    "economist.com",
 ]
 
 BOILERPLATE_PATTERNS = [
@@ -185,14 +237,6 @@ BOILERPLATE_PATTERNS = [
     r"this story has been shared.*",
 ]
 
-MANUAL_REVIEW_DOMAINS = [
-    "bloomberg.com",
-    "wsj.com",
-    "ft.com",
-    "barrons.com",
-    "economist.com",
-]
-
 LOW_QUALITY_SOURCE_PENALTIES = {
     "raw_html_text": 40,
     "wayback_raw_html_text": 50,
@@ -206,8 +250,9 @@ SOURCE_BONUSES = {
     "trafilatura_html": 10,
     "newspaper_html": 7,
     "json_ld_articlebody": 9,
-    "archive_trafilatura_html": 10,
-    "archive_newspaper_html": 7,
+    "archive_trafilatura_html": 14,
+    "archive_newspaper_html": 12,
+    "archive_json_ld_articlebody": 10,
     "wayback_trafilatura_html": 8,
     "wayback_newspaper_html": 6,
     "trafilatura_url": 4,
@@ -237,7 +282,12 @@ def setup_env() -> anthropic.Anthropic:
 # =========================================================
 
 def normalize_text(s: str) -> str:
-    return " ".join(str(s).strip().lower().split())
+    s = str(s or "").lower().strip()
+    s = s.replace("’", "'")
+    s = s.replace("“", '"').replace("”", '"')
+    s = re.sub(r"[^a-z0-9&.\-'/ ]+", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 
 def get_aliases_for_firm(fund_name: str) -> List[str]:
@@ -255,6 +305,20 @@ def get_aliases_for_firm(fund_name: str) -> List[str]:
             deduped.append(alias)
 
     return deduped
+
+
+def alias_hit(text: str, aliases: List[str]) -> bool:
+    norm_text = normalize_text(text)
+    if not norm_text:
+        return False
+
+    for alias in aliases:
+        a = normalize_text(alias)
+        if not a:
+            continue
+        if a in norm_text:
+            return True
+    return False
 
 
 # =========================================================
@@ -283,10 +347,8 @@ def should_trust_existing_text(summary_text: str, summary_source: str) -> bool:
 
     if wc >= MIN_WORDS_STRONG_SUCCESS and src not in {"google_news", ""}:
         return True
-
     if wc >= 600:
         return True
-
     return False
 
 
@@ -477,36 +539,91 @@ def wayback_url(url: str) -> str:
     return f"https://web.archive.org/web/0/{quote(url, safe=':/?&=%')}"
 
 
+def extract_meta_refresh_target(html_text: str) -> Optional[str]:
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+        meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
+        if not meta:
+            return None
+        content = meta.get("content", "")
+        m = re.search(r'url=(.+)$', content, flags=re.I)
+        if not m:
+            return None
+        return m.group(1).strip().strip("'").strip('"')
+    except Exception:
+        return None
+
+
+def find_archive_snapshot_in_html(html_text: str) -> Optional[str]:
+    if not html_text:
+        return None
+
+    patterns = [
+        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/[A-Za-z0-9]+',
+        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/o/[A-Za-z0-9]+',
+    ]
+
+    for pattern in patterns:
+        m = re.search(pattern, html_text)
+        if m:
+            return m.group(0)
+
+    try:
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        # canonical
+        for tag in soup.find_all("link", rel=True):
+            rels = " ".join(tag.get("rel", [])).lower()
+            href = tag.get("href", "") or ""
+            if "canonical" in rels and re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/", href):
+                return href.strip()
+
+        # og:url
+        for tag in soup.find_all("meta"):
+            prop = (tag.get("property") or "").lower()
+            content = tag.get("content") or ""
+            if prop == "og:url" and re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/", content):
+                return content.strip()
+
+        # first likely snapshot link
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/[A-Za-z0-9]+", href):
+                return href
+    except Exception:
+        pass
+
+    return None
+
+
 def lookup_archive_snapshot(url: str) -> Optional[str]:
     original = url.strip()
     if not original:
         return None
 
-    snapshot_patterns = [
-        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/[A-Za-z0-9]+',
-        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/o/[A-Za-z0-9]+',
-    ]
-
     for domain in ARCHIVE_MIRRORS:
-        lookup_urls = [
+        candidate_urls = [
             f"https://{domain}/{original}",
-            f"https://{domain}/?run=1&url={quote(original, safe='')}",
             f"https://{domain}/?url={quote(original, safe='')}",
+            f"https://{domain}/?run=1&url={quote(original, safe='')}",
         ]
 
-        for lookup_url in lookup_urls:
+        for lookup_url in candidate_urls:
             try:
-                resp = requests.get(lookup_url, headers=HEADERS, timeout=15, allow_redirects=True)
+                resp = requests.get(lookup_url, headers=HEADERS, timeout=18, allow_redirects=True)
                 final_url = str(getattr(resp, "url", "") or "").strip()
                 html = resp.text or ""
 
-                if re.search(rf"https?://{re.escape(domain)}/[A-Za-z0-9]+$", final_url):
-                    return final_url
+                if re.fullmatch(rf"https://{re.escape(domain)}/[A-Za-z0-9]+/?", final_url):
+                    return final_url.rstrip("/")
 
-                for pattern in snapshot_patterns:
-                    m = re.search(pattern, html)
-                    if m:
-                        return m.group(0)
+                meta_target = extract_meta_refresh_target(html)
+                if meta_target and re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/", meta_target):
+                    return meta_target.rstrip("/")
+
+                found = find_archive_snapshot_in_html(html)
+                if found:
+                    return found.rstrip("/")
             except Exception:
                 continue
 
@@ -659,73 +776,63 @@ def choose_best_candidate(candidates: List[Dict]) -> Tuple[str, str, bool]:
     return best["text"], best["source"], bool(best["boilerplate_stripped"])
 
 
-def try_extract_full_text(url: str) -> Tuple[str, str, bool]:
+def try_extract_full_text(url: str) -> Tuple[str, str, bool, Optional[str]]:
     candidates: List[Dict] = []
 
     canonical_url = resolve_redirect(url)
+    domain = get_domain(canonical_url)
+    archive_snapshot_url = None
 
     # 1) HTML-first on canonical URL
     html_text = retry_extract(fetch_html, canonical_url)
     if html_text:
-        text1 = retry_extract(trafilatura_extract_from_html, html_text)
-        add_candidate(candidates, text1, "trafilatura_html")
-
-        text2 = retry_extract(newspaper_extract, canonical_url, html_text)
-        add_candidate(candidates, text2, "newspaper_html")
-
-        text3 = retry_extract(extract_json_ld_articlebody, html_text)
-        add_candidate(candidates, text3, "json_ld_articlebody")
-
-        text4 = clean_html_to_text(html_text)
-        add_candidate(candidates, text4, "raw_html_text")
+        add_candidate(candidates, retry_extract(trafilatura_extract_from_html, html_text), "trafilatura_html")
+        add_candidate(candidates, retry_extract(newspaper_extract, canonical_url, html_text), "newspaper_html")
+        add_candidate(candidates, retry_extract(extract_json_ld_articlebody, html_text), "json_ld_articlebody")
+        add_candidate(candidates, clean_html_to_text(html_text), "raw_html_text")
 
     # 2) URL-based extraction on canonical URL
-    text5 = retry_extract(trafilatura_extract_from_url, canonical_url)
-    add_candidate(candidates, text5, "trafilatura_url")
+    add_candidate(candidates, retry_extract(trafilatura_extract_from_url, canonical_url), "trafilatura_url")
+    add_candidate(candidates, retry_extract(newspaper_extract, canonical_url), "newspaper_url")
 
-    text6 = retry_extract(newspaper_extract, canonical_url)
-    add_candidate(candidates, text6, "newspaper_url")
+    # 3) archive fallback BEFORE wayback for paywalled / hard domains
+    archive_first = domain in PAYWALL_PRIORITY_DOMAINS
 
-    # 3) Wayback fallback
+    if archive_first:
+        archive_snapshot_url = lookup_archive_snapshot(canonical_url)
+        if archive_snapshot_url:
+            archive_html = retry_extract(fetch_html, archive_snapshot_url)
+            if archive_html:
+                add_candidate(candidates, retry_extract(trafilatura_extract_from_html, archive_html), "archive_trafilatura_html")
+                add_candidate(candidates, retry_extract(newspaper_extract, archive_snapshot_url, archive_html), "archive_newspaper_html")
+                add_candidate(candidates, retry_extract(extract_json_ld_articlebody, archive_html), "archive_json_ld_articlebody")
+                add_candidate(candidates, clean_html_to_text(archive_html), "archive_raw_html_text")
+            add_candidate(candidates, retry_extract(trafilatura_extract_from_url, archive_snapshot_url), "archive_trafilatura_url")
+
+    # 4) Wayback fallback
     wb_url = wayback_url(canonical_url)
     wb_html = retry_extract(fetch_html, wb_url)
     if wb_html:
-        text7 = retry_extract(trafilatura_extract_from_html, wb_html)
-        add_candidate(candidates, text7, "wayback_trafilatura_html")
+        add_candidate(candidates, retry_extract(trafilatura_extract_from_html, wb_html), "wayback_trafilatura_html")
+        add_candidate(candidates, retry_extract(newspaper_extract, wb_url, wb_html), "wayback_newspaper_html")
+        add_candidate(candidates, retry_extract(extract_json_ld_articlebody, wb_html), "wayback_json_ld_articlebody")
+        add_candidate(candidates, clean_html_to_text(wb_html), "wayback_raw_html_text")
+    add_candidate(candidates, retry_extract(trafilatura_extract_from_url, wb_url), "wayback_trafilatura_url")
 
-        text8 = retry_extract(newspaper_extract, wb_url, wb_html)
-        add_candidate(candidates, text8, "wayback_newspaper_html")
+    # 5) archive fallback after wayback for everyone else
+    if not archive_first:
+        archive_snapshot_url = lookup_archive_snapshot(canonical_url)
+        if archive_snapshot_url:
+            archive_html = retry_extract(fetch_html, archive_snapshot_url)
+            if archive_html:
+                add_candidate(candidates, retry_extract(trafilatura_extract_from_html, archive_html), "archive_trafilatura_html")
+                add_candidate(candidates, retry_extract(newspaper_extract, archive_snapshot_url, archive_html), "archive_newspaper_html")
+                add_candidate(candidates, retry_extract(extract_json_ld_articlebody, archive_html), "archive_json_ld_articlebody")
+                add_candidate(candidates, clean_html_to_text(archive_html), "archive_raw_html_text")
+            add_candidate(candidates, retry_extract(trafilatura_extract_from_url, archive_snapshot_url), "archive_trafilatura_url")
 
-        text9 = retry_extract(extract_json_ld_articlebody, wb_html)
-        add_candidate(candidates, text9, "wayback_json_ld_articlebody")
-
-        text10 = clean_html_to_text(wb_html)
-        add_candidate(candidates, text10, "wayback_raw_html_text")
-
-    text11 = retry_extract(trafilatura_extract_from_url, wb_url)
-    add_candidate(candidates, text11, "wayback_trafilatura_url")
-
-    # 4) archive.ph / mirrors fallback
-    archive_url = lookup_archive_snapshot(canonical_url)
-    if archive_url:
-        archive_html = retry_extract(fetch_html, archive_url)
-        if archive_html:
-            text12 = retry_extract(trafilatura_extract_from_html, archive_html)
-            add_candidate(candidates, text12, "archive_trafilatura_html")
-
-            text13 = retry_extract(newspaper_extract, archive_url, archive_html)
-            add_candidate(candidates, text13, "archive_newspaper_html")
-
-            text14 = retry_extract(extract_json_ld_articlebody, archive_html)
-            add_candidate(candidates, text14, "archive_json_ld_articlebody")
-
-            text15 = clean_html_to_text(archive_html)
-            add_candidate(candidates, text15, "archive_raw_html_text")
-
-        text16 = retry_extract(trafilatura_extract_from_url, archive_url)
-        add_candidate(candidates, text16, "archive_trafilatura_url")
-
-    return choose_best_candidate(candidates)
+    best_text, best_source, best_stripped = choose_best_candidate(candidates)
+    return best_text, best_source, best_stripped, archive_snapshot_url
 
 
 # =========================================================
@@ -748,6 +855,7 @@ def make_manual_row(out: Dict, domain: str) -> Dict:
         "hard_domain_flag": domain in MANUAL_REVIEW_DOMAINS,
         "word_count": out.get("word_count", 0),
         "full_text_source": out.get("full_text_source", ""),
+        "archive_snapshot_url": out.get("archive_snapshot_url", ""),
     }
 
 
@@ -810,23 +918,32 @@ def main():
             url=url,
         )
 
+        # HARD SAFETY OVERRIDE: never drop if any alias appears in title/snippet
+        if decision == "DROP" and alias_hit(f"{title}\n{snippet}", aliases):
+            decision = "KEEP"
+            confidence = max(confidence, 0.8)
+            reason = f"Safety override: alias hit in title/snippet. Original reason: {reason}"
+
         out["relevance_decision"] = decision
         out["relevance_confidence"] = confidence
         out["relevance_reason"] = reason
 
         report["relevance_counts"][decision] = report["relevance_counts"].get(decision, 0) + 1
 
-        if decision == "DROP":
-            out["enrich_status"] = "dropped_relevance_gate"
+        # ONLY drop on explicit high-confidence DROP with no alias evidence
+        if decision == "DROP" and confidence >= DROP_CONFIDENCE_THRESHOLD:
+            out["enrich_status"] = "dropped_relevance_gate_high_confidence"
             out["word_count"] = existing_wc
             out["full_text_source"] = ""
             out["boilerplate_stripped"] = False
             out["manual_review_flag"] = False
+            out["archive_snapshot_url"] = ""
             enriched_rows.append(out)
             print(f"🗑️ DROP [{idx+1}/{rows_loaded}] {title[:90]}", flush=True)
             time.sleep(args.llm_sleep_seconds)
             continue
 
+        # KEEP or UNCERTAIN or low-confidence DROP => continue
         if should_trust_existing_text(snippet, summary_source):
             cleaned, changed = strip_boilerplate(snippet)
             out["summary"] = cleaned
@@ -839,12 +956,22 @@ def main():
             out["full_text_source"] = "existing_summary"
             out["boilerplate_stripped"] = changed
             out["manual_review_flag"] = False
+            out["archive_snapshot_url"] = ""
             enriched_rows.append(out)
             print(f"✅ KEEP EXISTING [{idx+1}/{rows_loaded}] wc={out['word_count']} | {title[:90]}", flush=True)
             time.sleep(args.llm_sleep_seconds)
             continue
 
-        text, source_label, stripped_flag = try_extract_full_text(url)
+        text, source_label, stripped_flag, archive_snapshot_url = try_extract_full_text(url)
+        out["archive_snapshot_url"] = archive_snapshot_url or ""
+
+        # SECOND SAFETY OVERRIDE: if extracted text contains alias, never drop
+        if text and decision == "DROP" and alias_hit(text, aliases):
+            out["relevance_decision"] = "KEEP"
+            out["relevance_confidence"] = max(confidence, 0.8)
+            out["relevance_reason"] = (
+                f"Safety override: alias hit in extracted text. Original reason: {reason}"
+            )
 
         if text:
             cleaned_wc = word_count(text)
@@ -916,6 +1043,7 @@ def main():
             "hard_domain_flag",
             "word_count",
             "full_text_source",
+            "archive_snapshot_url",
         ]).to_csv(MANUAL_QUEUE_PATH, index=False)
 
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
