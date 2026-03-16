@@ -25,7 +25,7 @@ parser = argparse.ArgumentParser(description="CI2 QWASS enricher")
 parser.add_argument("--input", type=str, required=True, help="Path to collector append CSV")
 parser.add_argument("--output-dir", type=str, default=None, help="Directory for enriched outputs")
 parser.add_argument("--sleep-seconds", type=float, default=1.0, help="Delay between network calls")
-parser.add_argument("--llm-sleep-seconds", type=float, default=0.6, help="Delay between Claude relevance calls")
+parser.add_argument("--llm-sleep-seconds", type=float, default=0.4, help="Delay between Claude relevance calls")
 parser.add_argument("--max-rows", type=int, default=None, help="Optional max rows for testing")
 args = parser.parse_args()
 
@@ -36,9 +36,11 @@ args = parser.parse_args()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+
 def load_yaml(path: str) -> dict:
     with open(REPO_ROOT / path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
 
 PATHS = load_yaml("config/paths.yaml")
 FIRMS_CONFIG = load_yaml("config/firms.yaml")
@@ -118,9 +120,13 @@ HEADERS = {
     "Referer": "https://news.google.com/",
 }
 
-MIN_WORDS_FORCE_ENRICH = 200
-MIN_WORDS_MAYBE_OK = 400
-MIN_WORDS_ARTICLE_GOOD = 250
+# User logic:
+# <200 words -> likely just summary / too short
+# 200-400 -> ambiguous / often still not good enough
+# >400 -> probably full article or close enough
+MIN_WORDS_CLEAR_FAILURE = 200
+MIN_WORDS_PARTIAL = 400
+MIN_WORDS_STRONG_SUCCESS = 400
 
 RELEVANCE_MODEL = "claude-haiku-4-5"
 RELEVANCE_MAX_TOKENS = 180
@@ -151,6 +157,12 @@ BOILERPLATE_PATTERNS = [
     r"before it.?s here, it.?s on the bloomberg terminal.*",
     r"make sense of the markets.*",
     r"jump to comments.*",
+    r"sign in.*",
+    r"skip to content.*",
+    r"share on facebook.*",
+    r"share on twitter.*",
+    r"copy link.*",
+    r"this story has been shared.*",
 ]
 
 MANUAL_REVIEW_DOMAINS = [
@@ -222,9 +234,25 @@ def word_count(text: str) -> int:
     return len(re.findall(r"\b\S+\b", text))
 
 
-def looks_like_substantial_text(text: str) -> bool:
-    wc = word_count(text)
-    return wc > MIN_WORDS_MAYBE_OK
+def should_trust_existing_text(summary_text: str, summary_source: str) -> bool:
+    wc = word_count(summary_text)
+    src = str(summary_source or "").strip().lower()
+
+    if wc >= MIN_WORDS_STRONG_SUCCESS and src not in {"google_news", ""}:
+        return True
+
+    if wc >= 600:
+        return True
+
+    return False
+
+
+def classify_text_length(wc: int) -> str:
+    if wc < MIN_WORDS_CLEAR_FAILURE:
+        return "too_short"
+    if wc < MIN_WORDS_PARTIAL:
+        return "partial"
+    return "strong"
 
 
 # =========================================================
@@ -257,14 +285,14 @@ def parse_relevance_response(text: str) -> Tuple[str, float, str]:
 def build_relevance_prompt(fund_name: str, aliases: List[str], title: str, snippet: str, source: str, url: str) -> str:
     alias_text = ", ".join(aliases)
 
-    return f"""You are filtering Google News discovery results for hedge fund reputation research.
+    return f"""You are filtering Google News discovery results for hedge fund and trading-firm reputation research.
 
 Task:
-Decide whether this article is likely worth enriching for the fund "{fund_name}".
+Decide whether this article is likely worth enriching for the firm "{fund_name}".
 
 Important:
-- Google News search results can be truncated.
-- The fund may be genuinely discussed in the article even if the snippet is incomplete.
+- Google News results can be truncated.
+- The article may genuinely discuss the firm even if the snippet is incomplete.
 - Favor KEEP when the article is plausibly about the firm or clearly finance/business relevant and likely tied to the firm.
 - Use DROP only for obvious false positives, unrelated name collisions, or clearly irrelevant articles.
 - Use UNCERTAIN for ambiguous cases.
@@ -274,7 +302,7 @@ Decision: KEEP or DROP or UNCERTAIN
 Confidence: <0.0 to 1.0>
 Reason: <one short sentence>
 
-Fund: {fund_name}
+Firm: {fund_name}
 Aliases: {alias_text}
 Title: {title}
 Snippet: {snippet}
@@ -319,7 +347,7 @@ def call_claude_relevance(
         except Exception as e:
             last_error = e
             print(f"⚠️ Relevance gate attempt {attempt}/{CLAUDE_RETRY_ATTEMPTS} failed: {e}", flush=True)
-            time.sleep(2.5)
+            time.sleep(2.0)
 
     print(f"⚠️ Relevance gate fallback due to repeated failure: {last_error}", flush=True)
     return "UNCERTAIN", 0.3, "Model call failed; defaulting to uncertain."
@@ -422,7 +450,10 @@ def strip_boilerplate(text: str) -> Tuple[str, bool]:
     for ln in lines:
         if not ln:
             continue
-        if len(ln.split()) <= 2 and ln.lower() in {"share", "subscribe", "advertisement", "newsletter"}:
+        low = ln.lower()
+        if len(ln.split()) <= 3 and low in {
+            "share", "subscribe", "advertisement", "newsletter", "sign in", "read more"
+        }:
             continue
         filtered.append(ln)
 
@@ -434,11 +465,6 @@ def strip_boilerplate(text: str) -> Tuple[str, bool]:
     return cleaned, changed
 
 
-def maybe_existing_text_good(text: str) -> bool:
-    wc = word_count(text)
-    return wc > MIN_WORDS_MAYBE_OK
-
-
 # =========================================================
 # ENRICHMENT CORE
 # =========================================================
@@ -446,46 +472,69 @@ def maybe_existing_text_good(text: str) -> bool:
 def try_extract_full_text(url: str) -> Tuple[str, str]:
     # 1) direct trafilatura from URL
     text = trafilatura_extract_from_url(url)
-    if word_count(text) >= MIN_WORDS_ARTICLE_GOOD:
+    if text:
         return text, "trafilatura"
 
-    # 2) fetch HTML then trafilatura/newspaper
+    # 2) fetch HTML then trafilatura/newspaper/raw
     html_text = fetch_html(url)
     if html_text:
         text2 = trafilatura_extract_from_html(html_text)
-        if word_count(text2) >= MIN_WORDS_ARTICLE_GOOD:
+        if text2:
             return text2, "trafilatura_html"
 
         text3 = newspaper_extract(url, html_text=html_text)
-        if word_count(text3) >= MIN_WORDS_ARTICLE_GOOD:
+        if text3:
             return text3, "newspaper_html"
 
         text4 = clean_html_to_text(html_text)
-        if word_count(text4) >= MIN_WORDS_ARTICLE_GOOD:
+        if text4:
             return text4, "raw_html_text"
 
     # 3) direct newspaper
     text5 = newspaper_extract(url)
-    if word_count(text5) >= MIN_WORDS_ARTICLE_GOOD:
+    if text5:
         return text5, "newspaper"
 
     # 4) wayback fallback
     wb_url = wayback_url(url)
     text6 = trafilatura_extract_from_url(wb_url)
-    if word_count(text6) >= MIN_WORDS_ARTICLE_GOOD:
+    if text6:
         return text6, "wayback_trafilatura"
 
     wb_html = fetch_html(wb_url)
     if wb_html:
         text7 = trafilatura_extract_from_html(wb_html)
-        if word_count(text7) >= MIN_WORDS_ARTICLE_GOOD:
+        if text7:
             return text7, "wayback_trafilatura_html"
 
         text8 = newspaper_extract(wb_url, html_text=wb_html)
-        if word_count(text8) >= MIN_WORDS_ARTICLE_GOOD:
+        if text8:
             return text8, "wayback_newspaper_html"
 
     return "", ""
+
+
+# =========================================================
+# OUTPUT HELPERS
+# =========================================================
+
+def make_manual_row(out: Dict, domain: str) -> Dict:
+    return {
+        "article_id": out.get("article_id", ""),
+        "fund_name": out.get("fund_name", ""),
+        "title": out.get("title", ""),
+        "url": out.get("url", ""),
+        "source": out.get("source", ""),
+        "summary": out.get("summary", ""),
+        "relevance_decision": out.get("relevance_decision", ""),
+        "relevance_confidence": out.get("relevance_confidence", ""),
+        "relevance_reason": out.get("relevance_reason", ""),
+        "enrich_status": out.get("enrich_status", ""),
+        "domain": domain,
+        "hard_domain_flag": domain in MANUAL_REVIEW_DOMAINS,
+        "word_count": out.get("word_count", 0),
+        "full_text_source": out.get("full_text_source", ""),
+    }
 
 
 # =========================================================
@@ -524,6 +573,7 @@ def main():
 
     for idx, row in df.iterrows():
         out = row.to_dict()
+
         fund_name = str(out.get("fund_name", "")).strip()
         aliases = get_aliases_for_firm(fund_name)
 
@@ -531,8 +581,10 @@ def main():
         snippet = str(out.get("summary", "") or "").strip()
         source = str(out.get("source", "") or "").strip()
         url = str(out.get("url", "") or "").strip()
+        summary_source = str(out.get("summary_source", "") or "").strip()
 
         existing_wc = word_count(snippet)
+        domain = get_domain(url)
 
         decision, confidence, reason = call_claude_relevance(
             client=client,
@@ -561,7 +613,8 @@ def main():
             time.sleep(args.llm_sleep_seconds)
             continue
 
-        if maybe_existing_text_good(snippet):
+        # Trust existing text only if it is genuinely substantial and not just a Google snippet
+        if should_trust_existing_text(snippet, summary_source):
             cleaned, changed = strip_boilerplate(snippet)
             out["summary"] = cleaned
             out["summary_source"] = out.get("summary_source") or "existing"
@@ -582,49 +635,41 @@ def main():
 
         if text:
             cleaned, changed = strip_boilerplate(text)
+            cleaned_wc = word_count(cleaned)
+            strength = classify_text_length(cleaned_wc)
+
             out["summary"] = cleaned
             out["summary_source"] = source_label
             out["retrieved_snippet"] = ""
             out["snippet_engine"] = source_label
             out["was_updated"] = True
-            out["enrich_status"] = f"success_{source_label}"
-            out["word_count"] = word_count(cleaned)
+            out["word_count"] = cleaned_wc
             out["full_text_source"] = source_label
             out["boilerplate_stripped"] = changed
-            out["manual_review_flag"] = False
-            enriched_rows.append(out)
-            print(f"✅ ENRICHED [{idx+1}/{rows_loaded}] {source_label} wc={out['word_count']} | {title[:90]}", flush=True)
-        else:
-            domain = get_domain(url)
-            manual_flag = True
 
-            out["enrich_status"] = "manual_review_needed"
+            if strength == "strong":
+                out["enrich_status"] = f"success_{source_label}"
+                out["manual_review_flag"] = False
+                enriched_rows.append(out)
+                print(f"✅ ENRICHED [{idx+1}/{rows_loaded}] {source_label} wc={cleaned_wc} | {title[:90]}", flush=True)
+            else:
+                out["enrich_status"] = f"manual_review_needed_{source_label}_{strength}"
+                out["manual_review_flag"] = True
+                enriched_rows.append(out)
+                manual_rows.append(make_manual_row(out, domain))
+                print(f"⚠️ PARTIAL [{idx+1}/{rows_loaded}] {source_label} wc={cleaned_wc} | {title[:90]}", flush=True)
+        else:
+            out["enrich_status"] = "manual_review_needed_failed_extraction"
             out["word_count"] = existing_wc
             out["full_text_source"] = ""
             out["boilerplate_stripped"] = False
-            out["manual_review_flag"] = manual_flag
+            out["manual_review_flag"] = True
 
             if not snippet:
                 out["summary"] = ""
 
             enriched_rows.append(out)
-
-            manual_row = {
-                "article_id": out.get("article_id", ""),
-                "fund_name": fund_name,
-                "title": title,
-                "url": url,
-                "source": source,
-                "summary": snippet,
-                "relevance_decision": decision,
-                "relevance_confidence": confidence,
-                "relevance_reason": reason,
-                "enrich_status": "manual_review_needed",
-                "domain": domain,
-                "hard_domain_flag": domain in MANUAL_REVIEW_DOMAINS,
-            }
-            manual_rows.append(manual_row)
-
+            manual_rows.append(make_manual_row(out, domain))
             print(f"⚠️ MANUAL [{idx+1}/{rows_loaded}] {domain} | {title[:90]}", flush=True)
 
         time.sleep(args.sleep_seconds)
@@ -640,6 +685,7 @@ def main():
     report["manual_queue_count"] = len(manual_df)
 
     enriched_df.to_csv(ENRICHED_PATH, index=False)
+
     if len(manual_df) > 0:
         manual_df.to_csv(MANUAL_QUEUE_PATH, index=False)
     else:
@@ -656,6 +702,8 @@ def main():
             "enrich_status",
             "domain",
             "hard_domain_flag",
+            "word_count",
+            "full_text_source",
         ]).to_csv(MANUAL_QUEUE_PATH, index=False)
 
     with open(REPORT_PATH, "w", encoding="utf-8") as f:
