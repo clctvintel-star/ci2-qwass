@@ -34,10 +34,11 @@ args = parser.parse_args()
 # CONFIG
 # =========================================================
 
-def load_yaml(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
+def load_yaml(path: str) -> dict:
+    with open(REPO_ROOT / path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
 
 PATHS = load_yaml("config/paths.yaml")
 FIRMS_CONFIG = load_yaml("config/firms.yaml")
