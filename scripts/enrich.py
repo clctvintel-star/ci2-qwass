@@ -285,17 +285,25 @@ def parse_relevance_response(text: str) -> Tuple[str, float, str]:
 def build_relevance_prompt(fund_name: str, aliases: List[str], title: str, snippet: str, source: str, url: str) -> str:
     alias_text = ", ".join(aliases)
 
-    return f"""You are filtering Google News discovery results for hedge fund and trading-firm reputation research.
+    return f"""You are validating Google News discovery results for hedge fund and trading-firm research.
 
 Task:
-Decide whether this article is likely worth enriching for the firm "{fund_name}".
+Decide whether this result is actually about, or at least explicitly mentions, the firm "{fund_name}" or one of its aliases.
 
-Important:
-- Google News results can be truncated.
-- The article may genuinely discuss the firm even if the snippet is incomplete.
-- Favor KEEP when the article is plausibly about the firm or clearly finance/business relevant and likely tied to the firm.
-- Use DROP only for obvious false positives, unrelated name collisions, or clearly irrelevant articles.
-- Use UNCERTAIN for ambiguous cases.
+Important rules:
+- KEEP if the title/snippet plausibly refers to the correct firm, even if the mention seems minor, peripheral, or not important.
+- KEEP if the result appears to be about a subsidiary, affiliate, or closely tied entity that is included in the alias list.
+- KEEP if the result is a roundup, hiring story, legal story, performance story, or market story that mentions the firm.
+- DROP only if this is clearly a false positive, wrong entity, unrelated person/place/thing, or obvious name collision.
+- Use UNCERTAIN only when you genuinely cannot tell from the title/snippet/URL.
+
+Do NOT judge whether the article is central enough, important enough, or worth scoring. Only judge whether it is actually referring to this firm.
+
+Examples of DROP:
+- "Jane Street" meaning a literal street
+- "millennium" meaning the era, not Millennium Management
+- a person named Schonfeld unrelated to the hedge fund
+- a company/article clearly about some other entity with a similar name
 
 Return exactly this format:
 Decision: KEEP or DROP or UNCERTAIN
