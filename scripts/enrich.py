@@ -31,10 +31,11 @@ args = parser.parse_args()
 
 
 # =========================================================
-# CONFIG
+# REPO / CONFIG
 # =========================================================
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PROMPTS_DIR = REPO_ROOT / "prompts"
 
 
 def load_yaml(path: str) -> dict:
@@ -42,8 +43,15 @@ def load_yaml(path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def load_text(path: Path) -> str:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing prompt file: {path}")
+    return path.read_text(encoding="utf-8")
+
+
 PATHS = load_yaml("config/paths.yaml")
 FIRMS_CONFIG = load_yaml("config/firms.yaml")
+RELEVANCE_PROMPT_TEMPLATE = load_text(PROMPTS_DIR / "relevance_gate_prompt.txt")
 
 DRIVE_ROOT = PATHS["ci2"]["drive_root"]
 QWASS_DB = PATHS["projects"]["qwass2"]["db"]
@@ -121,9 +129,9 @@ HEADERS = {
 }
 
 # User logic:
-# <200 words -> likely just summary / too short
-# 200-400 -> ambiguous / often still not good enough
-# >400 -> probably full article or close enough
+# <150 words -> too short
+# 150-349 -> partial / ambiguous
+# >=350 -> strong enough to accept
 MIN_WORDS_CLEAR_FAILURE = 150
 MIN_WORDS_PARTIAL = 350
 MIN_WORDS_STRONG_SUCCESS = 350
@@ -192,7 +200,7 @@ def setup_env() -> anthropic.Anthropic:
 
 
 # =========================================================
-# FIRM ALIAS HELPERS
+# FIRM / ALIAS HELPERS
 # =========================================================
 
 def normalize_text(s: str) -> str:
@@ -203,14 +211,16 @@ def get_aliases_for_firm(fund_name: str) -> List[str]:
     definitions = FIRMS_CONFIG.get("firm_definitions", {})
     meta = definitions.get(fund_name, {})
     aliases = [fund_name] + list(meta.get("aliases_safe", []))
-    aliases = [a.strip() for a in aliases if str(a).strip()]
+    aliases = [str(a).strip() for a in aliases if str(a).strip()]
+
     deduped = []
     seen = set()
-    for a in aliases:
-        key = normalize_text(a)
+    for alias in aliases:
+        key = normalize_text(alias)
         if key not in seen:
             seen.add(key)
-            deduped.append(a)
+            deduped.append(alias)
+
     return deduped
 
 
@@ -282,41 +292,23 @@ def parse_relevance_response(text: str) -> Tuple[str, float, str]:
     return decision, confidence, reason
 
 
-def build_relevance_prompt(fund_name: str, aliases: List[str], title: str, snippet: str, source: str, url: str) -> str:
+def build_relevance_prompt(
+    fund_name: str,
+    aliases: List[str],
+    title: str,
+    snippet: str,
+    source: str,
+    url: str,
+) -> str:
     alias_text = ", ".join(aliases)
-
-    return f"""You are validating Google News discovery results for hedge fund and trading-firm research.
-
-Task:
-Decide whether this result is actually about, or at least explicitly mentions, the firm "{fund_name}" or one of its aliases.
-
-Important rules:
-- KEEP if the title/snippet plausibly refers to the correct firm, even if the mention seems minor, peripheral, or not important.
-- KEEP if the result appears to be about a subsidiary, affiliate, or closely tied entity that is included in the alias list.
-- KEEP if the result is a roundup, hiring story, legal story, performance story, or market story that mentions the firm.
-- DROP only if this is clearly a false positive, wrong entity, unrelated person/place/thing, or obvious name collision.
-- Use UNCERTAIN only when you genuinely cannot tell from the title/snippet/URL.
-
-Do NOT judge whether the article is central enough, important enough, or worth scoring. Only judge whether it is actually referring to this firm.
-
-Examples of DROP:
-- "Jane Street" meaning a literal street
-- "millennium" meaning the era, not Millennium Management
-- a person named Schonfeld unrelated to the hedge fund
-- a company/article clearly about some other entity with a similar name
-
-Return exactly this format:
-Decision: KEEP or DROP or UNCERTAIN
-Confidence: <0.0 to 1.0>
-Reason: <one short sentence>
-
-Firm: {fund_name}
-Aliases: {alias_text}
-Title: {title}
-Snippet: {snippet}
-Source: {source}
-URL: {url}
-""".strip()
+    return RELEVANCE_PROMPT_TEMPLATE.format(
+        fund_name=fund_name,
+        aliases=alias_text,
+        title=title,
+        snippet=snippet,
+        source=source,
+        url=url,
+    )
 
 
 def call_claude_relevance(
@@ -354,7 +346,10 @@ def call_claude_relevance(
             return parse_relevance_response(text)
         except Exception as e:
             last_error = e
-            print(f"⚠️ Relevance gate attempt {attempt}/{CLAUDE_RETRY_ATTEMPTS} failed: {e}", flush=True)
+            print(
+                f"⚠️ Relevance gate attempt {attempt}/{CLAUDE_RETRY_ATTEMPTS} failed: {e}",
+                flush=True,
+            )
             time.sleep(2.0)
 
     print(f"⚠️ Relevance gate fallback due to repeated failure: {last_error}", flush=True)
@@ -474,7 +469,7 @@ def strip_boilerplate(text: str) -> Tuple[str, bool]:
 
 
 # =========================================================
-# ENRICHMENT CORE
+# EXTRACTION CORE
 # =========================================================
 
 def try_extract_full_text(url: str) -> Tuple[str, str]:
@@ -621,7 +616,6 @@ def main():
             time.sleep(args.llm_sleep_seconds)
             continue
 
-        # Trust existing text only if it is genuinely substantial and not just a Google snippet
         if should_trust_existing_text(snippet, summary_source):
             cleaned, changed = strip_boilerplate(snippet)
             out["summary"] = cleaned
