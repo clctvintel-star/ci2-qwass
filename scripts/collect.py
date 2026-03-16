@@ -6,7 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pandas as pd
@@ -112,6 +112,7 @@ CATEGORY_QUALIFIER = {
 }
 
 SECONDARY_TRIGGER_THRESHOLD = 5
+SECONDARY_DUP_RATIO_CUTOFF = 0.95
 DUPLICATE_HEAVY_PAGE_THRESHOLD = 0.85
 EARLY_STOP_EMPTY_PAGES = 1
 
@@ -152,7 +153,6 @@ def normalize_url(url: str) -> str:
         return ""
 
     parsed = urlparse(url.strip())
-
     scheme = (parsed.scheme or "https").lower()
     netloc = parsed.netloc.lower()
     if netloc.startswith("www."):
@@ -299,18 +299,32 @@ def load_existing_corpus(corpus_path: Path) -> pd.DataFrame:
         df["fund_name_canonical"] = ""
 
     if "normalized_url" not in df.columns:
-        df["normalized_url"] = df.get("url", "").fillna("").astype(str).apply(normalize_url)
+        if "url" in df.columns:
+            df["normalized_url"] = df["url"].fillna("").astype(str).apply(normalize_url)
+        else:
+            df["normalized_url"] = ""
 
     if "article_id" not in df.columns:
+        title_series = df["title"].fillna("").astype(str) if "title" in df.columns else pd.Series([""] * len(df), index=df.index)
+        source_series = df["source"].fillna("").astype(str) if "source" in df.columns else pd.Series([""] * len(df), index=df.index)
+        date_series = df["date"].fillna("").astype(str) if "date" in df.columns else pd.Series([""] * len(df), index=df.index)
+
         df["article_id"] = [
             make_article_id(nu, t, s, d)
             for nu, t, s, d in zip(
                 df["normalized_url"].astype(str),
-                df.get("title", "").fillna("").astype(str),
-                df.get("source", "").fillna("").astype(str),
-                df.get("date", "").fillna("").astype(str),
+                title_series,
+                source_series,
+                date_series,
             )
         ]
+
+    if "title" not in df.columns:
+        df["title"] = ""
+    if "source" not in df.columns:
+        df["source"] = ""
+    if "date" not in df.columns:
+        df["date"] = ""
 
     df["_fallback_key"] = add_fallback_key(df)
     return df
@@ -656,7 +670,18 @@ def main():
             collected_rows.extend(primary_rows)
             window_meta["queries_run"].append(primary_stats)
 
-            if primary_stats["accepted_results"] < SECONDARY_TRIGGER_THRESHOLD and plan.secondary_queries:
+            primary_dup_ratio = page_duplicate_ratio(
+                primary_stats["raw_results"],
+                primary_stats["accepted_results"],
+            )
+
+            should_run_secondary = (
+                primary_stats["accepted_results"] < SECONDARY_TRIGGER_THRESHOLD
+                and bool(plan.secondary_queries)
+                and primary_dup_ratio < SECONDARY_DUP_RATIO_CUTOFF
+            )
+
+            if should_run_secondary:
                 for secondary_query in plan.secondary_queries:
                     print(f"      Secondary rescue: {secondary_query}")
                     secondary_rows, secondary_stats = collect_query_window(
