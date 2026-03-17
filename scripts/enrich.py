@@ -1,3 +1,50 @@
+import importlib
+import subprocess
+import sys
+
+
+# =========================================================
+# DEPENDENCY BOOTSTRAP
+# =========================================================
+
+REQUIRED_PACKAGES = [
+    ("anthropic", "anthropic"),
+    ("pandas", "pandas"),
+    ("requests", "requests"),
+    ("trafilatura", "trafilatura"),
+    ("yaml", "pyyaml"),
+    ("bs4", "beautifulsoup4"),
+    ("dotenv", "python-dotenv"),
+    ("newspaper", "newspaper3k"),
+]
+
+OPTIONAL_FALLBACK_INSTALLS = [
+    "lxml[html_clean]",
+]
+
+
+def ensure_package(import_name: str, pip_name: str) -> None:
+    try:
+        importlib.import_module(import_name)
+    except ImportError:
+        print(f"📦 Installing missing package: {pip_name}", flush=True)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name])
+
+
+for import_name, pip_name in REQUIRED_PACKAGES:
+    ensure_package(import_name, pip_name)
+
+for pip_name in OPTIONAL_FALLBACK_INSTALLS:
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pip_name])
+    except Exception:
+        pass
+
+
+# =========================================================
+# NORMAL IMPORTS
+# =========================================================
+
 import argparse
 import json
 import os
