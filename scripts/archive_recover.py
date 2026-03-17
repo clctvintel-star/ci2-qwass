@@ -32,6 +32,12 @@ Modes:
 Install:
     pip install requests beautifulsoup4 lxml trafilatura playwright pandas
     playwright install chromium
+
+Notes:
+- This is a manual rescue tool, not a bulk enricher.
+- It now tries multiple lookup candidates:
+  input URL, normalized URL, canonical URL, http/https variants,
+  www/non-www variants, and slug-based archive search.
 """
 
 import argparse
@@ -133,6 +139,93 @@ def normalize_url(url: str) -> str:
     return urlunparse((scheme, netloc, path, "", query, ""))
 
 
+def drop_query_and_fragment(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or "/"
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+    return urlunparse((scheme, netloc, path, "", "", ""))
+
+
+def with_http_https_variants(url: str) -> List[str]:
+    parsed = urlparse(url)
+    path = parsed.path or "/"
+    out = []
+    for scheme in ["https", "http"]:
+        out.append(urlunparse((scheme, parsed.netloc, path, "", "", "")))
+    return out
+
+
+def with_www_variants(url: str) -> List[str]:
+    parsed = urlparse(url)
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc.lower()
+    path = parsed.path or "/"
+
+    hosts = {host}
+    if host.startswith("www."):
+        hosts.add(host[4:])
+    else:
+        hosts.add("www." + host)
+
+    out = []
+    for h in hosts:
+        out.append(urlunparse((scheme, h, path, "", "", "")))
+    return out
+
+
+def get_slug_tokens(url: str) -> List[str]:
+    path = urlparse(url).path.lower()
+    parts = re.split(r"[^a-z0-9]+", path)
+    stop = {
+        "news", "features", "feature", "article", "articles", "www", "com", "amp",
+        "the", "and", "for", "with", "from", "that", "this",
+        "2023", "2024", "2025", "2026", "2027", "2028",
+        "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12",
+    }
+    tokens = [p for p in parts if p and len(p) >= 4 and p not in stop]
+    return tokens
+
+
+def build_lookup_candidates(input_url: str, live_canonical_url: str) -> List[str]:
+    seeds = []
+    for u in [
+        input_url,
+        normalize_url(input_url),
+        live_canonical_url,
+        normalize_url(live_canonical_url),
+    ]:
+        if u:
+            seeds.append(u)
+            seeds.append(drop_query_and_fragment(u))
+
+    candidates = []
+    seen = set()
+
+    for seed in seeds:
+        if not seed:
+            continue
+
+        variants = [seed]
+        variants.extend(with_http_https_variants(seed))
+
+        more = []
+        for v in variants:
+            more.extend(with_www_variants(v))
+
+        variants.extend(more)
+
+        for v in variants:
+            v = drop_query_and_fragment(normalize_url(v))
+            if v and v not in seen:
+                seen.add(v)
+                candidates.append(v)
+
+    return candidates
+
+
 def fetch_live_canonical(url: str, timeout: int = 20) -> Optional[str]:
     try:
         resp = requests.get(
@@ -177,59 +270,63 @@ def safe_attr(locator, attr: str) -> str:
         return ""
 
 
-def find_snapshot_from_results_page(page, canonical_url: str, notes: List[str]) -> Optional[str]:
-    candidates: List[Tuple[str, str]] = []
+def find_snapshot_from_results_page(page, target_url: str, notes: List[str]) -> Optional[str]:
+    """
+    Parse an archive results page and identify the best snapshot link
+    using path and slug-token matching, not just exact URL matching.
+    """
+    candidates: List[Tuple[str, str, int]] = []
 
     try:
         anchors = page.locator("a").all()
     except Exception:
         anchors = []
 
-    canonical_norm = normalize_url(canonical_url)
-    canonical_path = urlparse(canonical_norm).path.rstrip("/")
+    target_norm = drop_query_and_fragment(normalize_url(target_url))
+    target_path = urlparse(target_norm).path.rstrip("/").lower()
+    target_tokens = set(get_slug_tokens(target_norm))
 
     for a in anchors:
         href = safe_attr(a, "href").strip()
-        text = text_from_locator(a)
+        text = text_from_locator(a).strip()
 
         if not href:
             continue
 
         href_abs = urljoin(page.url, href)
+        blob = f"{href_abs}\n{text}".lower()
+
+        score = 0
 
         if SNAPSHOT_URL_RE.match(href_abs):
-            candidates.append((href_abs, text))
-            continue
+            score += 5
 
-        blob = f"{href_abs}\n{text}"
-        if canonical_norm in blob:
-            candidates.append((href_abs, text))
-            continue
+        if target_path and target_path in blob:
+            score += 20
 
-        if canonical_path and canonical_path in blob:
-            candidates.append((href_abs, text))
-            continue
+        blob_tokens = set(re.split(r"[^a-z0-9]+", blob))
+        overlap = len(target_tokens.intersection(blob_tokens))
+        score += overlap * 3
+
+        if overlap >= 3:
+            score += 10
+
+        if score > 0:
+            candidates.append((href_abs, text, score))
 
     if not candidates:
-        notes.append("No candidates found on results page.")
+        notes.append("No usable candidates found on results page.")
         return None
 
-    for href, _ in candidates:
-        if SNAPSHOT_URL_RE.match(href):
-            notes.append(f"Using snapshot candidate from results page: {href}")
-            return href
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    best_href, best_text, best_score = candidates[0]
+    notes.append(f"Best results-page candidate score={best_score}: {best_href}")
 
-    for href, _ in candidates:
-        if "archive." in href:
-            notes.append(f"Using archive candidate from results page: {href}")
-            return href
-
-    notes.append("Candidates found, but none looked usable.")
-    return None
+    return best_href
 
 
-def try_direct_newest(page, host: str, canonical_url: str, notes: List[str]) -> Optional[str]:
-    newest_url = f"https://{host}/newest/{canonical_url}"
+def try_direct_newest(page, host: str, candidate_url: str, notes: List[str]) -> Optional[str]:
+    newest_url = f"https://{host}/newest/{candidate_url}"
     notes.append(f"Trying direct newest endpoint: {newest_url}")
 
     try:
@@ -241,21 +338,21 @@ def try_direct_newest(page, host: str, canonical_url: str, notes: List[str]) -> 
             notes.append(f"Direct newest resolved to snapshot: {current}")
             return current
 
-        found = find_snapshot_from_results_page(page, canonical_url, notes)
+        found = find_snapshot_from_results_page(page, candidate_url, notes)
         if found:
             return found
 
     except PlaywrightTimeoutError:
-        notes.append(f"Timeout on direct newest endpoint: {host}")
+        notes.append(f"Timeout on direct newest endpoint: {host} | {candidate_url}")
     except Exception as e:
-        notes.append(f"Error on direct newest endpoint {host}: {e}")
+        notes.append(f"Error on direct newest endpoint {host} | {candidate_url}: {e}")
 
     return None
 
 
-def try_search_form(page, host: str, canonical_url: str, notes: List[str]) -> Optional[str]:
+def try_search_form(page, host: str, candidate_url: str, notes: List[str]) -> Optional[str]:
     base = f"https://{host}/"
-    notes.append(f"Trying search form on {base}")
+    notes.append(f"Trying search form on {base} with: {candidate_url}")
 
     try:
         page.goto(base, wait_until="domcontentloaded", timeout=30000)
@@ -279,7 +376,7 @@ def try_search_form(page, host: str, canonical_url: str, notes: List[str]) -> Op
             notes.append(f"No visible search input found on {host}")
             return None
 
-        search_input.fill(canonical_url)
+        search_input.fill(candidate_url)
         page.keyboard.press("Enter")
         page.wait_for_timeout(3000)
 
@@ -288,28 +385,65 @@ def try_search_form(page, host: str, canonical_url: str, notes: List[str]) -> Op
             notes.append(f"Search form went directly to snapshot: {current}")
             return current
 
-        found = find_snapshot_from_results_page(page, canonical_url, notes)
+        found = find_snapshot_from_results_page(page, candidate_url, notes)
         if found:
             return found
 
+        slug_tokens = get_slug_tokens(candidate_url)
+        if slug_tokens:
+            slug_query = " ".join(slug_tokens[:6])
+            notes.append(f"Retrying search with slug query: {slug_query}")
+
+            page.goto(base, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(1000)
+
+            inputs = page.locator("input[type='text']").all()
+            search_input = None
+            for inp in reversed(inputs):
+                try:
+                    if inp.is_visible():
+                        search_input = inp
+                        break
+                except Exception:
+                    continue
+
+            if search_input is not None:
+                search_input.fill(slug_query)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(3000)
+
+                current = page.url
+                if SNAPSHOT_URL_RE.match(current):
+                    notes.append(f"Slug search went directly to snapshot: {current}")
+                    return current
+
+                found = find_snapshot_from_results_page(page, candidate_url, notes)
+                if found:
+                    return found
+
     except PlaywrightTimeoutError:
-        notes.append(f"Timeout using search form on {host}")
+        notes.append(f"Timeout using search form on {host} | {candidate_url}")
     except Exception as e:
-        notes.append(f"Error using search form on {host}: {e}")
+        notes.append(f"Error using search form on {host} | {candidate_url}: {e}")
 
     return None
 
 
-def resolve_latest_snapshot(page, canonical_url: str, notes: List[str]) -> Tuple[str, str]:
-    for host in ARCHIVE_HOSTS:
-        snapshot = try_direct_newest(page, host, canonical_url, notes)
-        if snapshot:
-            return snapshot, host
+def resolve_latest_snapshot(page, input_url: str, live_canonical_url: str, notes: List[str]) -> Tuple[str, str]:
+    candidates = build_lookup_candidates(input_url, live_canonical_url)
+    notes.append(f"Built {len(candidates)} lookup candidates.")
 
-    for host in ARCHIVE_HOSTS:
-        snapshot = try_search_form(page, host, canonical_url, notes)
-        if snapshot:
-            return snapshot, host
+    for candidate in candidates:
+        for host in ARCHIVE_HOSTS:
+            snapshot = try_direct_newest(page, host, candidate, notes)
+            if snapshot:
+                return snapshot, host
+
+    for candidate in candidates:
+        for host in ARCHIVE_HOSTS:
+            snapshot = try_search_form(page, host, candidate, notes)
+            if snapshot:
+                return snapshot, host
 
     raise RuntimeError("Could not resolve a latest archive snapshot from any archive host.")
 
@@ -405,14 +539,26 @@ def recover_from_archive(url: str, show_browser: bool = False) -> RecoverResult:
         notes.append("Could not discover live canonical URL; using normalized input URL.")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not show_browser)
+        browser = p.chromium.launch(
+            headless=not show_browser,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = browser.new_context(
             user_agent=DEFAULT_HEADERS["User-Agent"],
             viewport={"width": 1400, "height": 1200},
         )
         page = context.new_page()
 
-        snapshot_url, host_used = resolve_latest_snapshot(page, live_canonical, notes)
+        snapshot_url, host_used = resolve_latest_snapshot(
+            page,
+            normalized_input,
+            live_canonical,
+            notes,
+        )
         notes.append(f"Resolved latest snapshot: {snapshot_url}")
 
         page.goto(snapshot_url, wait_until="domcontentloaded", timeout=45000)
@@ -500,7 +646,6 @@ def guess_url_column(df: pd.DataFrame) -> str:
         if c in lower_map:
             return lower_map[c]
 
-    # fallback: first column containing 'url'
     for c in df.columns:
         if "url" in c.lower():
             return c
