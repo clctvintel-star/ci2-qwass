@@ -1,7 +1,8 @@
 from playwright.sync_api import sync_playwright
 import trafilatura
 import time
-import json
+import sys
+
 
 ARCHIVE_HOSTS = [
     "archive.ph",
@@ -10,95 +11,62 @@ ARCHIVE_HOSTS = [
 ]
 
 
-def find_snapshot(page, url):
+def fetch_article(url):
 
-    for host in ARCHIVE_HOSTS:
+    with sync_playwright() as p:
 
-        search_url = f"https://{host}/search/?q={url}"
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
 
-        print(f"Searching {search_url}")
+        snapshot_url = None
 
-        page.goto(search_url, wait_until="domcontentloaded")
+        for host in ARCHIVE_HOSTS:
+
+            resolver = f"https://{host}/?run=1&url={url}"
+
+            print("Trying resolver:", resolver)
+
+            page.goto(resolver, wait_until="domcontentloaded")
+
+            time.sleep(4)
+
+            current = page.url
+
+            if "/?run=1&url=" not in current:
+                snapshot_url = current
+                break
+
+        if not snapshot_url:
+            raise Exception("Archive resolver did not return snapshot")
+
+        print("Snapshot:", snapshot_url)
+
+        page.goto(snapshot_url, wait_until="domcontentloaded")
 
         try:
-            page.wait_for_selector("a[href^='https://archive.']", timeout=8000)
+            page.locator("text=Webpage").first.click(timeout=3000)
         except:
-            continue
+            pass
 
-        links = page.locator("a[href^='https://archive.']")
+        time.sleep(2)
 
-        if links.count() == 0:
-            continue
+        html = page.content()
 
-        snapshot = links.first.get_attribute("href")
-
-        if snapshot:
-            return snapshot
-
-    return None
-
-
-def open_snapshot(page, snapshot_url):
-
-    print("Opening snapshot:", snapshot_url)
-
-    page.goto(snapshot_url, wait_until="domcontentloaded")
-
-    # click webpage tab if present
-    try:
-        page.locator("text=Webpage").first.click(timeout=3000)
-    except:
-        pass
-
-    time.sleep(2)
-
-    html = page.content()
-
-    return html
-
-
-def extract_article(html):
+        browser.close()
 
     text = trafilatura.extract(html)
 
     return text
 
 
-def fetch_article(url):
-
-    with sync_playwright() as p:
-
-        browser = p.chromium.launch(headless=True)
-
-        page = browser.new_page()
-
-        snapshot = find_snapshot(page, url)
-
-        if not snapshot:
-            browser.close()
-            raise Exception("No snapshot found")
-
-        html = open_snapshot(page, snapshot)
-
-        browser.close()
-
-    article_text = extract_article(html)
-
-    return {
-        "url": url,
-        "snapshot": snapshot,
-        "text": article_text
-    }
-
-
 if __name__ == "__main__":
 
-    url = "https://www.bloomberg.com/news/features/2026-02-05/how-two-sigma-founder-s-divorce-fight-hangs-over-hedge-fund-s-future"
+    url = sys.argv[1] if len(sys.argv) > 1 else None
 
-    result = fetch_article(url)
+    if not url:
+        raise Exception("Provide URL")
 
-    with open("article.json", "w") as f:
-        json.dump(result, f, indent=2)
+    text = fetch_article(url)
 
-    print("\nSUCCESS\n")
-    print(result["text"][:2000])
+    print("\n\nARTICLE TEXT PREVIEW\n")
+    print(text[:2000])
