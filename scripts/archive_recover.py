@@ -12,13 +12,12 @@ Designed for:
 - Reuters Pro / blocked cases
 - other pages where live extraction failed or was too thin
 
-This version uses the working browser flow:
-1. open archive home
-2. use the LOWER blue "search saved snapshots" form
-3. search by exact URL / variants
-4. click best result
-5. click Webpage tab if present
-6. extract text from archived page
+This version uses the working flow:
+1. Query archive search directly
+2. Parse the results page for the newest snapshot link
+3. Open the snapshot
+4. Click "Webpage" if present
+5. Extract article text from the archived page
 
 Install:
     pip install requests beautifulsoup4 lxml trafilatura playwright pandas
@@ -33,7 +32,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse, quote_plus
 
 import pandas as pd
 import requests
@@ -79,7 +78,6 @@ DROP_QUERY_KEYS = {
     "source",
 }
 
-# Real snapshot URL: archive.xx/<id>
 REAL_SNAPSHOT_RE = re.compile(
     r"^https?://archive\.(?:today|ph|is|vn|li|md)/[A-Za-z0-9]{4,}(?:[#?].*)?$",
     re.IGNORECASE,
@@ -279,52 +277,8 @@ def is_real_snapshot_url(url: str) -> bool:
     return bool(url and REAL_SNAPSHOT_RE.match(url))
 
 
-def choose_search_form_input(page):
-    """
-    Pick the LOWER blue search form, not the top red save form.
-    """
-    selectors = [
-        "input[placeholder='query']",
-        "form input[placeholder='query']",
-        "input[name='q']",
-    ]
-
-    for sel in selectors:
-        try:
-            loc = page.locator(sel)
-            count = loc.count()
-            for i in range(count):
-                candidate = loc.nth(i)
-                if candidate.is_visible():
-                    return candidate
-        except Exception:
-            pass
-
-    # Fallback: choose the lowest visible text input
-    try:
-        inputs = page.locator("input[type='text']").all()
-    except Exception:
-        inputs = []
-
-    visible = []
-    for inp in inputs:
-        try:
-            if inp.is_visible():
-                box = inp.bounding_box()
-                if box:
-                    visible.append((inp, box["y"]))
-        except Exception:
-            continue
-
-    if visible:
-        visible.sort(key=lambda x: x[1], reverse=True)
-        return visible[0][0]
-
-    return None
-
-
 # -------------------------------------------------------------------
-# RESULT PAGE SCORING / CLICKTHROUGH
+# ARCHIVE RESULT PARSING
 # -------------------------------------------------------------------
 
 def candidate_score(target_url: str, href_abs: str, text: str) -> int:
@@ -338,32 +292,27 @@ def candidate_score(target_url: str, href_abs: str, text: str) -> int:
     score = 0
 
     if is_real_snapshot_url(href_abs):
-        score += 20
+        score += 50
 
     if target_path and target_path in blob:
-        score += 30
+        score += 50
 
     overlap = len(target_tokens.intersection(blob_tokens))
-    score += overlap * 4
+    score += overlap * 6
 
     if overlap >= 3:
-        score += 10
+        score += 15
 
     if "bloomberg" in blob and "bloomberg" in target_norm:
-        score += 3
-
+        score += 5
     if "ft" in blob and "ft.com" in target_norm:
-        score += 3
+        score += 5
 
     return score
 
 
-def collect_snapshot_candidates_from_page(page, target_url: str, notes: List[str]) -> List[Tuple[str, str, int]]:
-    candidates: List[Tuple[str, str, int]] = []
-
-    current = page.url
-    if is_real_snapshot_url(current):
-        candidates.append((current, page.title() or "", 1000))
+def collect_ranked_snapshot_links(page, target_url: str, notes: List[str]) -> List[Tuple[str, str, int]]:
+    ranked: List[Tuple[str, str, int]] = []
 
     try:
         anchors = page.locator("a").all()
@@ -380,10 +329,10 @@ def collect_snapshot_candidates_from_page(page, target_url: str, notes: List[str
         score = candidate_score(target_url, href_abs, text)
 
         if score > 0:
-            candidates.append((href_abs, text, score))
+            ranked.append((href_abs, text, score))
 
     dedup = {}
-    for href, text, score in candidates:
+    for href, text, score in ranked:
         if href not in dedup or score > dedup[href][1]:
             dedup[href] = (text, score)
 
@@ -391,137 +340,131 @@ def collect_snapshot_candidates_from_page(page, target_url: str, notes: List[str
     out.sort(key=lambda x: x[2], reverse=True)
 
     if out:
-        notes.append(f"Found {len(out)} candidate(s) on page; best score={out[0][2]}: {out[0][0]}")
+        notes.append(f"Ranked {len(out)} candidate links; best={out[0][0]} score={out[0][2]}")
     else:
-        notes.append("No usable snapshot candidates found on page.")
+        notes.append("No candidate links found on page.")
 
     return out
 
 
-def resolve_snapshot_from_current_page(page, target_url: str, notes: List[str]) -> Optional[str]:
-    current = page.url.strip()
+def resolve_snapshot_from_search_results(page, target_url: str, notes: List[str]) -> Optional[str]:
+    ranked = collect_ranked_snapshot_links(page, target_url, notes)
 
-    if is_real_snapshot_url(current):
-        notes.append(f"Current page is real snapshot: {current}")
-        return current
-
-    candidates = collect_snapshot_candidates_from_page(page, target_url, notes)
-    for href, _, _ in candidates:
+    for href, _, _ in ranked:
         if is_real_snapshot_url(href):
-            notes.append(f"Resolved snapshot from page candidates: {href}")
+            notes.append(f"Resolved snapshot from results: {href}")
             return href
 
     return None
-
-
-def click_best_result_if_needed(page, target_url: str, notes: List[str]) -> Optional[str]:
-    """
-    On archive search results page, click the best result if we are not already at a snapshot.
-    """
-    snap = resolve_snapshot_from_current_page(page, target_url, notes)
-    if snap:
-        return snap
-
-    try:
-        anchors = page.locator("a").all()
-    except Exception:
-        anchors = []
-
-    ranked = []
-    for a in anchors:
-        href = safe_attr(a, "href").strip()
-        text = text_from_locator(a).strip()
-        if not href:
-            continue
-
-        href_abs = urljoin(page.url, href)
-        score = candidate_score(target_url, href_abs, text)
-        if score > 0:
-            ranked.append((a, href_abs, score, text))
-
-    ranked.sort(key=lambda x: x[2], reverse=True)
-
-    if not ranked:
-        notes.append("No clickable ranked results found.")
-        return None
-
-    best_anchor, best_href, best_score, best_text = ranked[0]
-    notes.append(f"Clicking best result score={best_score}: {best_href}")
-
-    try:
-        best_anchor.click(timeout=5000)
-        page.wait_for_timeout(1800)
-    except Exception:
-        try:
-            safe_goto(page, best_href, timeout_ms=30000)
-        except Exception as e:
-            notes.append(f"Failed to open best result: {e}")
-            return None
-
-    return resolve_snapshot_from_current_page(page, target_url, notes)
 
 
 # -------------------------------------------------------------------
 # ARCHIVE SEARCH STRATEGIES
 # -------------------------------------------------------------------
 
-def try_search_form(page, host: str, candidate_url: str, notes: List[str]) -> Optional[str]:
+def try_search_query_url(page, host: str, candidate_url: str, notes: List[str]) -> Optional[str]:
+    """
+    Hit the archive search endpoint directly.
+    """
+    search_url = f"https://{host}/search/?q={quote_plus(candidate_url)}"
+    notes.append(f"Trying archive search endpoint: {search_url}")
+
+    try:
+        safe_goto(page, search_url, timeout_ms=30000)
+        snap = resolve_snapshot_from_search_results(page, candidate_url, notes)
+        if snap:
+            return snap
+    except PlaywrightTimeoutError:
+        notes.append(f"Timeout on archive search endpoint {host} | {candidate_url}")
+    except Exception as e:
+        notes.append(f"Error on archive search endpoint {host} | {candidate_url}: {e}")
+
+    return None
+
+
+def try_search_homepage_form(page, host: str, candidate_url: str, notes: List[str]) -> Optional[str]:
+    """
+    Fallback to the lower blue search form on the homepage.
+    """
     base = f"https://{host}/"
-    notes.append(f"Trying archive SEARCH form on {base} with: {candidate_url}")
+    notes.append(f"Trying homepage search form on {base} with: {candidate_url}")
 
     try:
         safe_goto(page, base, timeout_ms=30000)
 
-        search_input = choose_search_form_input(page)
+        # Lower blue box tends to be the last visible text input / placeholder=query
+        search_input = None
+
+        selectors = [
+            "input[placeholder='query']",
+            "form input[placeholder='query']",
+            "input[name='q']",
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                count = loc.count()
+                for i in range(count):
+                    item = loc.nth(i)
+                    if item.is_visible():
+                        search_input = item
+                        break
+            except Exception:
+                pass
+            if search_input is not None:
+                break
+
         if search_input is None:
-            notes.append(f"Could not identify lower search input on {host}")
+            try:
+                inputs = page.locator("input[type='text']").all()
+            except Exception:
+                inputs = []
+
+            visible = []
+            for inp in inputs:
+                try:
+                    if inp.is_visible():
+                        box = inp.bounding_box()
+                        if box:
+                            visible.append((inp, box["y"]))
+                except Exception:
+                    continue
+
+            if visible:
+                visible.sort(key=lambda x: x[1], reverse=True)
+                search_input = visible[0][0]
+
+        if search_input is None:
+            notes.append(f"Could not identify search input on {host}")
             return None
 
         search_input.fill(candidate_url)
         search_input.press("Enter")
         page.wait_for_timeout(2500)
 
-        snap = click_best_result_if_needed(page, candidate_url, notes)
+        snap = resolve_snapshot_from_search_results(page, candidate_url, notes)
         if snap:
             return snap
 
     except PlaywrightTimeoutError:
-        notes.append(f"Timeout using search form on {host} | {candidate_url}")
+        notes.append(f"Timeout using homepage search form on {host} | {candidate_url}")
     except Exception as e:
-        notes.append(f"Error using search form on {host} | {candidate_url}: {e}")
+        notes.append(f"Error using homepage search form on {host} | {candidate_url}: {e}")
 
     return None
 
 
-def try_headline_search(page, host: str, target_url: str, notes: List[str]) -> Optional[str]:
+def try_headline_fallback(page, host: str, target_url: str, notes: List[str]) -> Optional[str]:
     tokens = get_slug_tokens(target_url)
     if not tokens:
         return None
 
     query = " ".join(tokens[:6])
-    base = f"https://{host}/"
-    notes.append(f"Trying headline fallback on {base} with: {query}")
+    notes.append(f"Trying headline fallback on {host}: {query}")
 
-    try:
-        safe_goto(page, base, timeout_ms=30000)
-
-        search_input = choose_search_form_input(page)
-        if search_input is None:
-            notes.append(f"Could not identify lower search input on {host} for headline fallback")
-            return None
-
-        search_input.fill(query)
-        search_input.press("Enter")
-        page.wait_for_timeout(2500)
-
-        snap = click_best_result_if_needed(page, target_url, notes)
-        if snap:
-            return snap
-
-    except PlaywrightTimeoutError:
-        notes.append(f"Timeout using headline fallback on {host} | {query}")
-    except Exception as e:
-        notes.append(f"Error using headline fallback on {host} | {query}: {e}")
+    snap = try_search_query_url(page, host, query, notes)
+    if snap:
+        return snap
 
     return None
 
@@ -530,16 +473,23 @@ def resolve_latest_snapshot(page, input_url: str, live_canonical_url: str, notes
     candidates = build_lookup_candidates(input_url, live_canonical_url)
     notes.append(f"Built {len(candidates)} lookup candidates.")
 
-    # Pass 1: exact URL / normalized / host variants through archive search flow
+    # Pass 1: direct search endpoint by URL variants
     for candidate in candidates:
         for host in ARCHIVE_HOSTS:
-            snapshot = try_search_form(page, host, candidate, notes)
+            snapshot = try_search_query_url(page, host, candidate, notes)
             if snapshot:
                 return snapshot, host
 
-    # Pass 2: headline/slug search fallback
+    # Pass 2: homepage form by URL variants
+    for candidate in candidates:
+        for host in ARCHIVE_HOSTS:
+            snapshot = try_search_homepage_form(page, host, candidate, notes)
+            if snapshot:
+                return snapshot, host
+
+    # Pass 3: headline fallback
     for host in ARCHIVE_HOSTS:
-        snapshot = try_headline_search(page, host, live_canonical_url or input_url, notes)
+        snapshot = try_headline_fallback(page, host, live_canonical_url or input_url, notes)
         if snapshot:
             return snapshot, host
 
@@ -581,6 +531,7 @@ def clean_archive_html(html: str) -> str:
         r"Buy me a coffee",
         r"My url is alive and I want to archive its content",
         r"I want to search the archive for saved snapshots",
+        r"search examples:",
     ]
     regex = re.compile("|".join(bad_text_patterns), re.IGNORECASE)
 
@@ -671,7 +622,6 @@ def recover_from_archive(url: str, show_browser: bool = False) -> RecoverResult:
         notes.append(f"Resolved latest snapshot: {snapshot_url}")
 
         safe_goto(page, snapshot_url, timeout_ms=45000)
-
         click_webpage_tab_if_present(page, notes)
         page.wait_for_timeout(1200)
 
