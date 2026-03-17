@@ -2,32 +2,31 @@
 # -*- coding: utf-8 -*-
 
 """
-scripts/archive_recover.py
+archive_recover.py
 
-Manual recovery tool for hard article URLs using archive.is / archive.today sister sites.
+Manual archive recovery for hard URLs (Bloomberg, FT, Reuters etc).
 
-Designed for:
-- Bloomberg
-- FT
-- Reuters Pro / blocked cases
-- other pages where live extraction failed or was too thin
+Key behavior
+------------
+1. Try archive /newest/ endpoint
+2. If no snapshot, try archive search form
+3. If still no result, try headline search fallback
+4. Only accept real snapshot URLs (archive.ph/ABC123 etc)
 """
 
 import argparse
 import json
 import re
 import sys
-import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from typing import List, Optional
+from urllib.parse import urlparse, urljoin
 
-import pandas as pd
 import requests
 import trafilatura
 from bs4 import BeautifulSoup
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 
 ARCHIVE_HOSTS = [
@@ -39,353 +38,239 @@ ARCHIVE_HOSTS = [
     "archive.md",
 ]
 
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    )
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122 Safari/537.36"
+)
 
-DROP_QUERY_KEYS = {
-    "embedded-checkout",
-    "utm_source",
-    "utm_medium",
-    "utm_campaign",
-    "utm_term",
-    "utm_content",
-    "fbclid",
-    "gclid",
-}
+HEADERS = {"User-Agent": USER_AGENT}
 
-SNAPSHOT_URL_RE = re.compile(
-    r"^https?://archive\.(?:is|today|ph|li|md|vn)/[A-Za-z0-9]{4,}",
-    re.IGNORECASE,
+
+SNAPSHOT_RE = re.compile(
+    r"https?://archive\.(?:today|ph|is|li|md|vn)/[A-Za-z0-9]{4,}$",
+    re.I,
 )
 
 
-# --------------------------------------------------------
-# DATA STRUCTURES
-# --------------------------------------------------------
+# ------------------------------------------------------------
+# DATA STRUCT
+# ------------------------------------------------------------
 
 @dataclass
 class RecoverResult:
+
     input_url: str
     normalized_input_url: str
     live_canonical_url: str
     archive_snapshot_url: str
     archive_host_used: str
+
     page_title: str
     article_title: str
     byline: str
     date: str
+
     text: str
     word_count: int
     extraction_status: str
+
     notes: List[str]
 
 
-# --------------------------------------------------------
-# URL NORMALIZATION
-# --------------------------------------------------------
+# ------------------------------------------------------------
+# URL UTIL
+# ------------------------------------------------------------
 
-def normalize_url(url: str) -> str:
-    url = (url or "").strip()
-
-    parsed = urlparse(url)
-
-    scheme = parsed.scheme or "https"
-    netloc = parsed.netloc.lower()
-    path = parsed.path or "/"
-
-    cleaned = []
-
-    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
-
-        if k.lower() in DROP_QUERY_KEYS or k.lower().startswith("utm_"):
-            continue
-
-        cleaned.append((k, v))
-
-    query = urlencode(cleaned) if cleaned else ""
-
-    if path != "/" and path.endswith("/"):
-        path = path[:-1]
-
-    return urlunparse((scheme, netloc, path, "", query, ""))
+def normalize(url: str) -> str:
+    return url.strip()
 
 
-def drop_query_and_fragment(url: str) -> str:
-    p = urlparse(url)
+def slug_tokens(url: str):
 
-    path = p.path.rstrip("/") or "/"
+    path = urlparse(url).path.lower()
 
-    return urlunparse((p.scheme or "https", p.netloc, path, "", "", ""))
+    parts = re.split(r"[^a-z0-9]+", path)
 
+    stop = {
+        "news",
+        "feature",
+        "features",
+        "article",
+        "the",
+        "and",
+        "with",
+        "from",
+        "2026",
+    }
 
-# --------------------------------------------------------
-# VARIANT BUILDING
-# --------------------------------------------------------
-
-def with_http_https_variants(url: str) -> List[str]:
-
-    p = urlparse(url)
-
-    path = p.path or "/"
-
-    return [
-        urlunparse(("https", p.netloc, path, "", "", "")),
-        urlunparse(("http", p.netloc, path, "", "", "")),
-    ]
+    return [p for p in parts if len(p) > 3 and p not in stop]
 
 
-def with_www_variants(url: str) -> List[str]:
+# ------------------------------------------------------------
+# CANONICAL
+# ------------------------------------------------------------
 
-    p = urlparse(url)
-
-    host = p.netloc.lower()
-
-    path = p.path or "/"
-
-    hosts = {host}
-
-    if host.startswith("www."):
-        hosts.add(host[4:])
-    else:
-        hosts.add("www." + host)
-
-    return [urlunparse((p.scheme or "https", h, path, "", "", "")) for h in hosts]
-
-
-def build_lookup_candidates(input_url: str, live_canonical_url: str) -> List[str]:
-
-    seeds = [
-        input_url,
-        normalize_url(input_url),
-        live_canonical_url,
-        normalize_url(live_canonical_url),
-    ]
-
-    candidates = []
-    seen = set()
-
-    for seed in seeds:
-
-        if not seed:
-            continue
-
-        variants = [seed]
-
-        variants += with_http_https_variants(seed)
-
-        more = []
-
-        for v in variants:
-            more += with_www_variants(v)
-
-        variants += more
-
-        for v in variants:
-
-            v = drop_query_and_fragment(normalize_url(v))
-
-            if v not in seen:
-
-                seen.add(v)
-
-                candidates.append(v)
-
-    return candidates
-
-
-# --------------------------------------------------------
-# CANONICAL DETECTION
-# --------------------------------------------------------
-
-def fetch_live_canonical(url: str) -> Optional[str]:
+def fetch_canonical(url):
 
     try:
 
-        r = requests.get(url, headers=DEFAULT_HEADERS, timeout=20)
+        r = requests.get(url, headers=HEADERS, timeout=15)
 
         soup = BeautifulSoup(r.text, "lxml")
 
-        canonical = soup.find("link", rel=lambda x: x and "canonical" in x)
+        tag = soup.find("link", rel="canonical")
 
-        if canonical and canonical.get("href"):
+        if tag and tag.get("href"):
+            return tag["href"]
 
-            return normalize_url(urljoin(r.url, canonical["href"]))
-
-        return normalize_url(r.url)
+        return r.url
 
     except Exception:
 
-        return None
+        return url
 
 
-# --------------------------------------------------------
+# ------------------------------------------------------------
 # PLAYWRIGHT HELPERS
-# --------------------------------------------------------
+# ------------------------------------------------------------
 
-def safe_goto(page, url: str, timeout_ms=30000):
+def goto(page, url):
 
-    page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-    page.wait_for_timeout(1200)
-
-
-def choose_search_form_input(page):
-
-    inputs = page.locator("input[type='text']").all()
-
-    visible = []
-
-    for i in inputs:
-
-        try:
-
-            if i.is_visible():
-                visible.append(i)
-
-        except Exception:
-            pass
-
-    if visible:
-
-        return visible[-1]
-
-    return None
+    page.wait_for_timeout(1000)
 
 
-# --------------------------------------------------------
-# SNAPSHOT RESOLUTION
-# --------------------------------------------------------
+def snapshot_links(page):
 
-def collect_snapshot_candidates(page):
+    links = []
 
-    anchors = page.locator("a").all()
-
-    results = []
-
-    for a in anchors:
+    for a in page.locator("a").all():
 
         href = a.get_attribute("href") or ""
 
-        if SNAPSHOT_URL_RE.match(href):
+        href = urljoin(page.url, href)
 
-            results.append(href)
+        if SNAPSHOT_RE.match(href):
 
-    return results
+            links.append(href)
+
+    return links
 
 
-def resolve_snapshot_from_current_page(page):
+def resolve_snapshot(page):
 
     url = page.url
 
-    if SNAPSHOT_URL_RE.match(url):
-
+    if SNAPSHOT_RE.match(url):
         return url
 
-    candidates = collect_snapshot_candidates(page)
+    links = snapshot_links(page)
 
-    if candidates:
-
-        return candidates[0]
-
-    return None
-
-
-# --------------------------------------------------------
-# ARCHIVE SEARCH
-# --------------------------------------------------------
-
-def try_direct_newest(page, host, candidate):
-
-    url = f"https://{host}/newest/{candidate}"
-
-    safe_goto(page, url)
-
-    snap = resolve_snapshot_from_current_page(page)
-
-    if snap:
-
-        return snap
+    if links:
+        return links[0]
 
     return None
 
 
-def try_search_form(page, host, candidate):
+# ------------------------------------------------------------
+# ARCHIVE STRATEGIES
+# ------------------------------------------------------------
 
-    safe_goto(page, f"https://{host}/")
+def try_newest(page, host, url):
 
-    inp = choose_search_form_input(page)
+    target = f"https://{host}/newest/{url}"
 
-    if not inp:
+    goto(page, target)
 
+    return resolve_snapshot(page)
+
+
+def try_search(page, host, url):
+
+    goto(page, f"https://{host}/")
+
+    inputs = page.locator("input[type=text]").all()
+
+    if not inputs:
         return None
 
-    inp.fill(candidate)
+    box = inputs[-1]
 
-    inp.press("Enter")
+    box.fill(url)
+
+    box.press("Enter")
 
     page.wait_for_timeout(2000)
 
-    snap = resolve_snapshot_from_current_page(page)
-
-    return snap
+    return resolve_snapshot(page)
 
 
-def resolve_latest_snapshot(page, input_url, live_canonical_url):
+def try_headline(page, host, url):
 
-    candidates = build_lookup_candidates(input_url, live_canonical_url)
+    tokens = slug_tokens(url)
 
-    for c in candidates:
+    if not tokens:
+        return None
 
-        for host in ARCHIVE_HOSTS:
+    q = "+".join(tokens[:6])
 
-            snap = try_direct_newest(page, host, c)
+    search = f"https://{host}/?q={q}"
 
-            if snap:
+    goto(page, search)
 
-                return snap, host
+    return resolve_snapshot(page)
 
-    for c in candidates:
 
-        for host in ARCHIVE_HOSTS:
+def resolve_archive(page, url):
 
-            snap = try_search_form(page, host, c)
+    for host in ARCHIVE_HOSTS:
 
-            if snap:
+        snap = try_newest(page, host, url)
 
-                return snap, host
+        if snap:
+            return snap, host
+
+    for host in ARCHIVE_HOSTS:
+
+        snap = try_search(page, host, url)
+
+        if snap:
+            return snap, host
+
+    for host in ARCHIVE_HOSTS:
+
+        snap = try_headline(page, host, url)
+
+        if snap:
+            return snap, host
 
     raise RuntimeError("No archive snapshot found")
 
 
-# --------------------------------------------------------
+# ------------------------------------------------------------
 # EXTRACTION
-# --------------------------------------------------------
+# ------------------------------------------------------------
 
-def clean_archive_html(html):
+def clean_html(html):
 
     soup = BeautifulSoup(html, "lxml")
 
-    for t in soup(["script", "style", "noscript"]):
-        t.decompose()
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
 
     return str(soup)
 
 
-def extract_reader_text(html, url_hint):
+def extract_text(html, url):
 
-    html = clean_archive_html(html)
+    html = clean_html(html)
 
-    meta = trafilatura.extract_metadata(html, default_url=url_hint)
+    meta = trafilatura.extract_metadata(html, default_url=url)
 
     title = meta.title if meta else ""
-
     author = meta.author if meta else ""
-
     date = meta.date if meta else ""
 
     text = trafilatura.extract(html)
@@ -396,32 +281,32 @@ def extract_reader_text(html, url_hint):
 
         text = soup.get_text("\n")
 
-    return title or "", author or "", date or "", text or ""
+    return title, author, date, text
 
 
-# --------------------------------------------------------
-# MAIN RECOVERY
-# --------------------------------------------------------
+# ------------------------------------------------------------
+# RECOVERY
+# ------------------------------------------------------------
 
-def recover_from_archive(url, show_browser=False):
+def recover(url, show_browser=False):
 
     notes = []
 
-    normalized = normalize_url(url)
+    url = normalize(url)
 
-    canonical = fetch_live_canonical(normalized) or normalized
+    canonical = fetch_canonical(url)
 
     with sync_playwright() as p:
 
         browser = p.chromium.launch(headless=not show_browser)
 
-        ctx = browser.new_context(user_agent=DEFAULT_HEADERS["User-Agent"])
+        ctx = browser.new_context(user_agent=USER_AGENT)
 
         page = ctx.new_page()
 
-        snapshot_url, host = resolve_latest_snapshot(page, normalized, canonical)
+        snapshot, host = resolve_archive(page, canonical)
 
-        safe_goto(page, snapshot_url)
+        goto(page, snapshot)
 
         html = page.content()
 
@@ -429,31 +314,26 @@ def recover_from_archive(url, show_browser=False):
 
         browser.close()
 
-    title, byline, date, text = extract_reader_text(html, canonical)
+    title, author, date, text = extract_text(html, canonical)
 
     wc = len(text.split())
 
-    if wc >= 150:
-
+    if wc > 150:
         status = "ok"
-
     elif wc > 0:
-
         status = "partial"
-
     else:
-
         status = "failed"
 
     return RecoverResult(
         url,
-        normalized,
+        url,
         canonical,
-        snapshot_url,
+        snapshot,
         host,
         page_title,
         title,
-        byline,
+        author,
         date,
         text,
         wc,
@@ -462,36 +342,33 @@ def recover_from_archive(url, show_browser=False):
     )
 
 
-# --------------------------------------------------------
+# ------------------------------------------------------------
 # OUTPUT
-# --------------------------------------------------------
+# ------------------------------------------------------------
 
-def save_single_outputs(result: RecoverResult, out_dir: Path):
+def save(result, outdir):
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
 
     slug = urlparse(result.live_canonical_url).path.split("/")[-1]
 
-    slug = re.sub(r"[^A-Za-z0-9]+", "_", slug)[:120]
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", slug)
 
-    j = out_dir / f"{slug}.json"
-
-    t = out_dir / f"{slug}.txt"
+    j = outdir / f"{slug}.json"
+    t = outdir / f"{slug}.txt"
 
     with open(j, "w") as f:
-
         json.dump(asdict(result), f, indent=2)
 
     with open(t, "w") as f:
-
         f.write(result.text)
 
     return j, t
 
 
-# --------------------------------------------------------
+# ------------------------------------------------------------
 # CLI
-# --------------------------------------------------------
+# ------------------------------------------------------------
 
 def main():
 
@@ -511,9 +388,9 @@ def main():
 
         sys.exit(1)
 
-    r = recover_from_archive(args.url, args.show_browser)
+    r = recover(args.url, args.show_browser)
 
-    j, t = save_single_outputs(r, Path(args.output_dir))
+    j, t = save(r, Path(args.output_dir))
 
     print(json.dumps(asdict(r), indent=2))
 
