@@ -24,8 +24,8 @@ from newspaper import Article
 parser = argparse.ArgumentParser(description="CI2 QWASS enricher")
 parser.add_argument("--input", type=str, required=True, help="Path to collector append CSV")
 parser.add_argument("--output-dir", type=str, default=None, help="Directory for enriched outputs")
-parser.add_argument("--sleep-seconds", type=float, default=0.8, help="Delay between network calls")
-parser.add_argument("--llm-sleep-seconds", type=float, default=0.25, help="Delay between relevance calls")
+parser.add_argument("--sleep-seconds", type=float, default=0.15, help="Delay between row processing")
+parser.add_argument("--llm-sleep-seconds", type=float, default=0.05, help="Delay after Claude relevance call")
 parser.add_argument("--max-rows", type=int, default=None, help="Optional max rows for testing")
 args = parser.parse_args()
 
@@ -167,44 +167,16 @@ MIN_WORDS_STRONG_SUCCESS = 350
 
 RELEVANCE_MODEL = "claude-haiku-4-5"
 RELEVANCE_MAX_TOKENS = 220
-
 CLAUDE_RETRY_ATTEMPTS = 3
-REQUEST_TIMEOUT = 30
 
-EXTRACTOR_RETRIES = 3
-EXTRACTOR_SLEEP_SECONDS = 1.2
+REQUEST_TIMEOUT = 20
+
+EXTRACTOR_RETRIES = 2
+EXTRACTOR_SLEEP_SECONDS = 0.35
 MIN_RETRY_ACCEPT_WORDS = 20
 
-# Very conservative drop threshold
+AUTOSAVE_EVERY = 10
 DROP_CONFIDENCE_THRESHOLD = 0.93
-
-ARCHIVE_MIRRORS = [
-    "archive.ph",
-    "archive.is",
-    "archive.today",
-    "archive.fo",
-    "archive.li",
-    "archive.md",
-    "archive.vn",
-]
-
-PAYWALL_PRIORITY_DOMAINS = [
-    "bloomberg.com",
-    "wsj.com",
-    "ft.com",
-    "barrons.com",
-    "economist.com",
-    "markets.businessinsider.com",
-    "businessinsider.com",
-]
-
-MANUAL_REVIEW_DOMAINS = [
-    "bloomberg.com",
-    "wsj.com",
-    "ft.com",
-    "barrons.com",
-    "economist.com",
-]
 
 BOILERPLATE_PATTERNS = [
     r"subscribe now.*",
@@ -237,26 +209,38 @@ BOILERPLATE_PATTERNS = [
     r"this story has been shared.*",
 ]
 
+MANUAL_REVIEW_DOMAINS = [
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "barrons.com",
+    "economist.com",
+]
+
+PAYWALL_DOMAINS = [
+    "bloomberg.com",
+    "wsj.com",
+    "ft.com",
+    "barrons.com",
+    "economist.com",
+]
+
 LOW_QUALITY_SOURCE_PENALTIES = {
-    "raw_html_text": 40,
-    "wayback_raw_html_text": 50,
-    "archive_raw_html_text": 50,
+    "raw_html_text": 45,
+    "wayback_raw_html_text": 55,
     "trafilatura_url": 5,
     "wayback_trafilatura_url": 12,
-    "archive_trafilatura_url": 12,
 }
 
 SOURCE_BONUSES = {
     "trafilatura_html": 10,
-    "newspaper_html": 7,
+    "newspaper_html": 8,
     "json_ld_articlebody": 9,
-    "archive_trafilatura_html": 14,
-    "archive_newspaper_html": 12,
-    "archive_json_ld_articlebody": 10,
-    "wayback_trafilatura_html": 8,
-    "wayback_newspaper_html": 6,
     "trafilatura_url": 4,
     "newspaper_url": 2,
+    "wayback_trafilatura_html": 6,
+    "wayback_newspaper_html": 5,
+    "wayback_json_ld_articlebody": 6,
 }
 
 
@@ -445,7 +429,7 @@ def call_claude_relevance(
                 f"⚠️ Relevance gate attempt {attempt}/{CLAUDE_RETRY_ATTEMPTS} failed: {e}",
                 flush=True,
             )
-            time.sleep(2.0)
+            time.sleep(1.5)
 
     print(f"⚠️ Relevance gate fallback due to repeated failure: {last_error}", flush=True)
     return "UNCERTAIN", 0.3, "Model call failed; defaulting to uncertain."
@@ -477,9 +461,9 @@ def resolve_redirect(url: str) -> str:
     for method in ("head", "get"):
         try:
             if method == "head":
-                resp = requests.head(url, headers=HEADERS, timeout=12, allow_redirects=True)
+                resp = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
             else:
-                resp = requests.get(url, headers=HEADERS, timeout=12, allow_redirects=True, stream=True)
+                resp = requests.get(url, headers=HEADERS, timeout=10, allow_redirects=True, stream=True)
 
             final_url = str(getattr(resp, "url", "") or "").strip()
             if final_url:
@@ -537,97 +521,6 @@ def newspaper_extract(url: str, html_text: Optional[str] = None) -> str:
 
 def wayback_url(url: str) -> str:
     return f"https://web.archive.org/web/0/{quote(url, safe=':/?&=%')}"
-
-
-def extract_meta_refresh_target(html_text: str) -> Optional[str]:
-    try:
-        soup = BeautifulSoup(html_text, "html.parser")
-        meta = soup.find("meta", attrs={"http-equiv": re.compile("refresh", re.I)})
-        if not meta:
-            return None
-        content = meta.get("content", "")
-        m = re.search(r'url=(.+)$', content, flags=re.I)
-        if not m:
-            return None
-        return m.group(1).strip().strip("'").strip('"')
-    except Exception:
-        return None
-
-
-def find_archive_snapshot_in_html(html_text: str) -> Optional[str]:
-    if not html_text:
-        return None
-
-    patterns = [
-        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/[A-Za-z0-9]+',
-        r'https?://archive\.(?:ph|is|today|fo|li|md|vn)/o/[A-Za-z0-9]+',
-    ]
-
-    for pattern in patterns:
-        m = re.search(pattern, html_text)
-        if m:
-            return m.group(0)
-
-    try:
-        soup = BeautifulSoup(html_text, "html.parser")
-
-        # canonical
-        for tag in soup.find_all("link", rel=True):
-            rels = " ".join(tag.get("rel", [])).lower()
-            href = tag.get("href", "") or ""
-            if "canonical" in rels and re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/", href):
-                return href.strip()
-
-        # og:url
-        for tag in soup.find_all("meta"):
-            prop = (tag.get("property") or "").lower()
-            content = tag.get("content") or ""
-            if prop == "og:url" and re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/", content):
-                return content.strip()
-
-        # first likely snapshot link
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/[A-Za-z0-9]+", href):
-                return href
-    except Exception:
-        pass
-
-    return None
-
-
-def lookup_archive_snapshot(url: str) -> Optional[str]:
-    original = url.strip()
-    if not original:
-        return None
-
-    for domain in ARCHIVE_MIRRORS:
-        candidate_urls = [
-            f"https://{domain}/{original}",
-            f"https://{domain}/?url={quote(original, safe='')}",
-            f"https://{domain}/?run=1&url={quote(original, safe='')}",
-        ]
-
-        for lookup_url in candidate_urls:
-            try:
-                resp = requests.get(lookup_url, headers=HEADERS, timeout=18, allow_redirects=True)
-                final_url = str(getattr(resp, "url", "") or "").strip()
-                html = resp.text or ""
-
-                if re.fullmatch(rf"https://{re.escape(domain)}/[A-Za-z0-9]+/?", final_url):
-                    return final_url.rstrip("/")
-
-                meta_target = extract_meta_refresh_target(html)
-                if meta_target and re.search(r"https?://archive\.(?:ph|is|today|fo|li|md|vn)/", meta_target):
-                    return meta_target.rstrip("/")
-
-                found = find_archive_snapshot_in_html(html)
-                if found:
-                    return found.rstrip("/")
-            except Exception:
-                continue
-
-    return None
 
 
 # =========================================================
@@ -776,14 +669,9 @@ def choose_best_candidate(candidates: List[Dict]) -> Tuple[str, str, bool]:
     return best["text"], best["source"], bool(best["boilerplate_stripped"])
 
 
-def try_extract_full_text(url: str) -> Tuple[str, str, bool, Optional[str]]:
+def try_live_extraction(canonical_url: str) -> Tuple[str, str, bool]:
     candidates: List[Dict] = []
 
-    canonical_url = resolve_redirect(url)
-    domain = get_domain(canonical_url)
-    archive_snapshot_url = None
-
-    # 1) HTML-first on canonical URL
     html_text = retry_extract(fetch_html, canonical_url)
     if html_text:
         add_candidate(candidates, retry_extract(trafilatura_extract_from_html, html_text), "trafilatura_html")
@@ -791,25 +679,15 @@ def try_extract_full_text(url: str) -> Tuple[str, str, bool, Optional[str]]:
         add_candidate(candidates, retry_extract(extract_json_ld_articlebody, html_text), "json_ld_articlebody")
         add_candidate(candidates, clean_html_to_text(html_text), "raw_html_text")
 
-    # 2) URL-based extraction on canonical URL
     add_candidate(candidates, retry_extract(trafilatura_extract_from_url, canonical_url), "trafilatura_url")
     add_candidate(candidates, retry_extract(newspaper_extract, canonical_url), "newspaper_url")
 
-    # 3) archive fallback BEFORE wayback for paywalled / hard domains
-    archive_first = domain in PAYWALL_PRIORITY_DOMAINS
+    return choose_best_candidate(candidates)
 
-    if archive_first:
-        archive_snapshot_url = lookup_archive_snapshot(canonical_url)
-        if archive_snapshot_url:
-            archive_html = retry_extract(fetch_html, archive_snapshot_url)
-            if archive_html:
-                add_candidate(candidates, retry_extract(trafilatura_extract_from_html, archive_html), "archive_trafilatura_html")
-                add_candidate(candidates, retry_extract(newspaper_extract, archive_snapshot_url, archive_html), "archive_newspaper_html")
-                add_candidate(candidates, retry_extract(extract_json_ld_articlebody, archive_html), "archive_json_ld_articlebody")
-                add_candidate(candidates, clean_html_to_text(archive_html), "archive_raw_html_text")
-            add_candidate(candidates, retry_extract(trafilatura_extract_from_url, archive_snapshot_url), "archive_trafilatura_url")
 
-    # 4) Wayback fallback
+def try_wayback_extraction(canonical_url: str) -> Tuple[str, str, bool]:
+    candidates: List[Dict] = []
+
     wb_url = wayback_url(canonical_url)
     wb_html = retry_extract(fetch_html, wb_url)
     if wb_html:
@@ -817,22 +695,35 @@ def try_extract_full_text(url: str) -> Tuple[str, str, bool, Optional[str]]:
         add_candidate(candidates, retry_extract(newspaper_extract, wb_url, wb_html), "wayback_newspaper_html")
         add_candidate(candidates, retry_extract(extract_json_ld_articlebody, wb_html), "wayback_json_ld_articlebody")
         add_candidate(candidates, clean_html_to_text(wb_html), "wayback_raw_html_text")
+
     add_candidate(candidates, retry_extract(trafilatura_extract_from_url, wb_url), "wayback_trafilatura_url")
 
-    # 5) archive fallback after wayback for everyone else
-    if not archive_first:
-        archive_snapshot_url = lookup_archive_snapshot(canonical_url)
-        if archive_snapshot_url:
-            archive_html = retry_extract(fetch_html, archive_snapshot_url)
-            if archive_html:
-                add_candidate(candidates, retry_extract(trafilatura_extract_from_html, archive_html), "archive_trafilatura_html")
-                add_candidate(candidates, retry_extract(newspaper_extract, archive_snapshot_url, archive_html), "archive_newspaper_html")
-                add_candidate(candidates, retry_extract(extract_json_ld_articlebody, archive_html), "archive_json_ld_articlebody")
-                add_candidate(candidates, clean_html_to_text(archive_html), "archive_raw_html_text")
-            add_candidate(candidates, retry_extract(trafilatura_extract_from_url, archive_snapshot_url), "archive_trafilatura_url")
+    return choose_best_candidate(candidates)
 
-    best_text, best_source, best_stripped = choose_best_candidate(candidates)
-    return best_text, best_source, best_stripped, archive_snapshot_url
+
+def try_extract_full_text(url: str) -> Tuple[str, str, bool, Optional[str]]:
+    canonical_url = resolve_redirect(url)
+    domain = get_domain(canonical_url)
+
+    # Fast path: live only
+    live_text, live_source, live_stripped = try_live_extraction(canonical_url)
+    live_wc = word_count(live_text)
+
+    if live_wc >= MIN_WORDS_STRONG_SUCCESS:
+        return live_text, live_source, live_stripped, None
+
+    # For obvious paywalls, don't burn time on wayback if live already failed badly
+    if domain in PAYWALL_DOMAINS and live_wc < MIN_WORDS_CLEAR_FAILURE:
+        return "", "", False, None
+
+    # Slow path: wayback only if live was not strong
+    wb_text, wb_source, wb_stripped = try_wayback_extraction(canonical_url)
+    wb_wc = word_count(wb_text)
+
+    if wb_wc > live_wc:
+        return wb_text, wb_source, wb_stripped, None
+
+    return live_text, live_source, live_stripped, None
 
 
 # =========================================================
@@ -857,6 +748,50 @@ def make_manual_row(out: Dict, domain: str) -> Dict:
         "full_text_source": out.get("full_text_source", ""),
         "archive_snapshot_url": out.get("archive_snapshot_url", ""),
     }
+
+
+def build_status_counts(enriched_rows: List[Dict]) -> Dict:
+    if not enriched_rows:
+        return {}
+    return (
+        pd.Series([r.get("enrich_status", "") for r in enriched_rows])
+        .fillna("")
+        .astype(str)
+        .value_counts()
+        .to_dict()
+    )
+
+
+def autosave_outputs(enriched_rows: List[Dict], manual_rows: List[Dict], report: Dict):
+    enriched_df = pd.DataFrame(enriched_rows)
+    enriched_df = ensure_columns(enriched_df)
+    enriched_df = enriched_df.reindex(columns=OUTPUT_COLUMNS)
+    enriched_df.to_csv(ENRICHED_PATH, index=False)
+
+    if len(manual_rows) > 0:
+        manual_df = pd.DataFrame(manual_rows)
+        manual_df.to_csv(MANUAL_QUEUE_PATH, index=False)
+    else:
+        pd.DataFrame(columns=[
+            "article_id",
+            "fund_name",
+            "title",
+            "url",
+            "source",
+            "summary",
+            "relevance_decision",
+            "relevance_confidence",
+            "relevance_reason",
+            "enrich_status",
+            "domain",
+            "hard_domain_flag",
+            "word_count",
+            "full_text_source",
+            "archive_snapshot_url",
+        ]).to_csv(MANUAL_QUEUE_PATH, index=False)
+
+    with open(REPORT_PATH, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
 
 
 # =========================================================
@@ -891,6 +826,7 @@ def main():
         "rows_loaded": rows_loaded,
         "relevance_counts": {"KEEP": 0, "DROP": 0, "UNCERTAIN": 0},
         "status_counts": {},
+        "manual_queue_count": 0,
     }
 
     for idx, row in df.iterrows():
@@ -908,17 +844,26 @@ def main():
         existing_wc = word_count(snippet)
         domain = get_domain(url)
 
-        decision, confidence, reason = call_claude_relevance(
-            client=client,
-            fund_name=fund_name,
-            aliases=aliases,
-            title=title,
-            snippet=snippet,
-            source=source,
-            url=url,
-        )
+        # -------------------------------------------------
+        # Fast relevance precheck
+        # -------------------------------------------------
+        if alias_hit(title, aliases) or alias_hit(snippet, aliases):
+            decision = "KEEP"
+            confidence = 0.99
+            reason = "Alias found in title/snippet."
+        else:
+            decision, confidence, reason = call_claude_relevance(
+                client=client,
+                fund_name=fund_name,
+                aliases=aliases,
+                title=title,
+                snippet=snippet,
+                source=source,
+                url=url,
+            )
+            time.sleep(args.llm_sleep_seconds)
 
-        # HARD SAFETY OVERRIDE: never drop if any alias appears in title/snippet
+        # Never drop if alias is present in title/snippet
         if decision == "DROP" and alias_hit(f"{title}\n{snippet}", aliases):
             decision = "KEEP"
             confidence = max(confidence, 0.8)
@@ -930,7 +875,6 @@ def main():
 
         report["relevance_counts"][decision] = report["relevance_counts"].get(decision, 0) + 1
 
-        # ONLY drop on explicit high-confidence DROP with no alias evidence
         if decision == "DROP" and confidence >= DROP_CONFIDENCE_THRESHOLD:
             out["enrich_status"] = "dropped_relevance_gate_high_confidence"
             out["word_count"] = existing_wc
@@ -940,121 +884,91 @@ def main():
             out["archive_snapshot_url"] = ""
             enriched_rows.append(out)
             print(f"🗑️ DROP [{idx+1}/{rows_loaded}] {title[:90]}", flush=True)
-            time.sleep(args.llm_sleep_seconds)
-            continue
-
-        # KEEP or UNCERTAIN or low-confidence DROP => continue
-        if should_trust_existing_text(snippet, summary_source):
-            cleaned, changed = strip_boilerplate(snippet)
-            out["summary"] = cleaned
-            out["summary_source"] = out.get("summary_source") or "existing"
-            out["retrieved_snippet"] = out.get("retrieved_snippet") or ""
-            out["snippet_engine"] = out.get("snippet_engine") or ""
-            out["was_updated"] = bool(changed)
-            out["enrich_status"] = "kept_existing_long_text"
-            out["word_count"] = word_count(cleaned)
-            out["full_text_source"] = "existing_summary"
-            out["boilerplate_stripped"] = changed
-            out["manual_review_flag"] = False
-            out["archive_snapshot_url"] = ""
-            enriched_rows.append(out)
-            print(f"✅ KEEP EXISTING [{idx+1}/{rows_loaded}] wc={out['word_count']} | {title[:90]}", flush=True)
-            time.sleep(args.llm_sleep_seconds)
-            continue
-
-        text, source_label, stripped_flag, archive_snapshot_url = try_extract_full_text(url)
-        out["archive_snapshot_url"] = archive_snapshot_url or ""
-
-        # SECOND SAFETY OVERRIDE: if extracted text contains alias, never drop
-        if text and decision == "DROP" and alias_hit(text, aliases):
-            out["relevance_decision"] = "KEEP"
-            out["relevance_confidence"] = max(confidence, 0.8)
-            out["relevance_reason"] = (
-                f"Safety override: alias hit in extracted text. Original reason: {reason}"
-            )
-
-        if text:
-            cleaned_wc = word_count(text)
-            strength = classify_text_length(cleaned_wc)
-
-            out["summary"] = text
-            out["summary_source"] = source_label
-            out["retrieved_snippet"] = ""
-            out["snippet_engine"] = source_label
-            out["was_updated"] = True
-            out["word_count"] = cleaned_wc
-            out["full_text_source"] = source_label
-            out["boilerplate_stripped"] = stripped_flag
-
-            if strength == "strong":
-                out["enrich_status"] = f"success_{source_label}"
-                out["manual_review_flag"] = False
-                enriched_rows.append(out)
-                print(f"✅ ENRICHED [{idx+1}/{rows_loaded}] {source_label} wc={cleaned_wc} | {title[:90]}", flush=True)
-            else:
-                out["enrich_status"] = f"manual_review_needed_{source_label}_{strength}"
-                out["manual_review_flag"] = True
-                enriched_rows.append(out)
-                manual_rows.append(make_manual_row(out, domain))
-                print(f"⚠️ PARTIAL [{idx+1}/{rows_loaded}] {source_label} wc={cleaned_wc} | {title[:90]}", flush=True)
         else:
-            out["enrich_status"] = "manual_review_needed_failed_extraction"
-            out["word_count"] = existing_wc
-            out["full_text_source"] = ""
-            out["boilerplate_stripped"] = False
-            out["manual_review_flag"] = True
+            if should_trust_existing_text(snippet, summary_source):
+                cleaned, changed = strip_boilerplate(snippet)
+                out["summary"] = cleaned
+                out["summary_source"] = out.get("summary_source") or "existing"
+                out["retrieved_snippet"] = out.get("retrieved_snippet") or ""
+                out["snippet_engine"] = out.get("snippet_engine") or ""
+                out["was_updated"] = bool(changed)
+                out["enrich_status"] = "kept_existing_long_text"
+                out["word_count"] = word_count(cleaned)
+                out["full_text_source"] = "existing_summary"
+                out["boilerplate_stripped"] = changed
+                out["manual_review_flag"] = False
+                out["archive_snapshot_url"] = ""
+                enriched_rows.append(out)
+                print(f"✅ KEEP EXISTING [{idx+1}/{rows_loaded}] wc={out['word_count']} | {title[:90]}", flush=True)
+            else:
+                text, source_label, stripped_flag, archive_snapshot_url = try_extract_full_text(url)
+                out["archive_snapshot_url"] = archive_snapshot_url or ""
 
-            if not snippet:
-                out["summary"] = ""
+                if text and decision == "DROP" and alias_hit(text, aliases):
+                    out["relevance_decision"] = "KEEP"
+                    out["relevance_confidence"] = max(confidence, 0.8)
+                    out["relevance_reason"] = (
+                        f"Safety override: alias hit in extracted text. Original reason: {reason}"
+                    )
 
-            enriched_rows.append(out)
-            manual_rows.append(make_manual_row(out, domain))
-            print(f"⚠️ MANUAL [{idx+1}/{rows_loaded}] {domain} | {title[:90]}", flush=True)
+                if text:
+                    cleaned_wc = word_count(text)
+                    strength = classify_text_length(cleaned_wc)
+
+                    out["summary"] = text
+                    out["summary_source"] = source_label
+                    out["retrieved_snippet"] = ""
+                    out["snippet_engine"] = source_label
+                    out["was_updated"] = True
+                    out["word_count"] = cleaned_wc
+                    out["full_text_source"] = source_label
+                    out["boilerplate_stripped"] = stripped_flag
+
+                    if strength == "strong":
+                        out["enrich_status"] = f"success_{source_label}"
+                        out["manual_review_flag"] = False
+                        enriched_rows.append(out)
+                        print(f"✅ ENRICHED [{idx+1}/{rows_loaded}] {source_label} wc={cleaned_wc} | {title[:90]}", flush=True)
+                    else:
+                        out["enrich_status"] = f"manual_review_needed_{source_label}_{strength}"
+                        out["manual_review_flag"] = True
+                        enriched_rows.append(out)
+                        manual_rows.append(make_manual_row(out, domain))
+                        print(f"⚠️ PARTIAL [{idx+1}/{rows_loaded}] {source_label} wc={cleaned_wc} | {title[:90]}", flush=True)
+                else:
+                    out["enrich_status"] = "manual_review_needed_failed_extraction"
+                    out["word_count"] = existing_wc
+                    out["full_text_source"] = ""
+                    out["boilerplate_stripped"] = False
+                    out["manual_review_flag"] = True
+
+                    if not snippet:
+                        out["summary"] = ""
+
+                    enriched_rows.append(out)
+                    manual_rows.append(make_manual_row(out, domain))
+                    print(f"⚠️ MANUAL [{idx+1}/{rows_loaded}] {domain} | {title[:90]}", flush=True)
+
+        report["status_counts"] = build_status_counts(enriched_rows)
+        report["manual_queue_count"] = len(manual_rows)
+
+        if (idx + 1) % AUTOSAVE_EVERY == 0:
+            autosave_outputs(enriched_rows, manual_rows, report)
+            print(
+                f"💾 AUTOSAVED [{idx+1}/{rows_loaded}] enriched={len(enriched_rows)} manual={len(manual_rows)}",
+                flush=True,
+            )
 
         time.sleep(args.sleep_seconds)
 
-    enriched_df = pd.DataFrame(enriched_rows)
-    enriched_df = ensure_columns(enriched_df)
-    enriched_df = enriched_df.reindex(columns=OUTPUT_COLUMNS)
-
-    manual_df = pd.DataFrame(manual_rows)
-
-    status_counts = enriched_df["enrich_status"].fillna("").astype(str).value_counts().to_dict()
-    report["status_counts"] = status_counts
-    report["manual_queue_count"] = len(manual_df)
-
-    enriched_df.to_csv(ENRICHED_PATH, index=False)
-
-    if len(manual_df) > 0:
-        manual_df.to_csv(MANUAL_QUEUE_PATH, index=False)
-    else:
-        pd.DataFrame(columns=[
-            "article_id",
-            "fund_name",
-            "title",
-            "url",
-            "source",
-            "summary",
-            "relevance_decision",
-            "relevance_confidence",
-            "relevance_reason",
-            "enrich_status",
-            "domain",
-            "hard_domain_flag",
-            "word_count",
-            "full_text_source",
-            "archive_snapshot_url",
-        ]).to_csv(MANUAL_QUEUE_PATH, index=False)
-
-    with open(REPORT_PATH, "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2)
+    autosave_outputs(enriched_rows, manual_rows, report)
 
     print("\n=== ENRICHMENT SUMMARY ===", flush=True)
     print(f"Rows loaded:          {rows_loaded}", flush=True)
     print(f"KEEP:                 {report['relevance_counts'].get('KEEP', 0)}", flush=True)
     print(f"DROP:                 {report['relevance_counts'].get('DROP', 0)}", flush=True)
     print(f"UNCERTAIN:            {report['relevance_counts'].get('UNCERTAIN', 0)}", flush=True)
-    print(f"Manual queue count:   {len(manual_df)}", flush=True)
+    print(f"Manual queue count:   {len(manual_rows)}", flush=True)
     print(f"Saved enriched file:  {ENRICHED_PATH}", flush=True)
     print(f"Saved manual queue:   {MANUAL_QUEUE_PATH}", flush=True)
     print(f"Saved report:         {REPORT_PATH}", flush=True)
