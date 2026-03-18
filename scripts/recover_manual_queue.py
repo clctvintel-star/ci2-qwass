@@ -4,25 +4,32 @@
 """
 CI2 manual-queue recovery pipeline
 
-Order:
-1) FT syndication first (for FT URLs)
-2) Diffbot on original URL
-3) Diffbot on AMP variants
-4) Diffbot on Wayback latest pointer
-5) Syndicated copy via Google News RSS -> Diffbot
-6) Direct archive snapshot URL from row (if already present)
-7) RemovePaywall Selenium fallback for Bloomberg / FT only
+Fast path for Bloomberg / FT:
+1) Syndication first
+2) Direct archive snapshot URL from row (if already present)
+3) Diffbot on canonical URL
+4) Diffbot on ONE AMP variant only (?output=amp)
+5) Diffbot on Wayback latest pointer
+6) RemovePaywall Selenium fallback
 
-Input:
-- CSV manual queue (current QWASS2 flow)
+Default path for everything else:
+1) Diffbot on original URL
+2) Diffbot on ONE AMP variant
+3) Diffbot on Wayback latest pointer
+4) Syndicated copy via Google News RSS -> Diffbot
+5) Direct archive snapshot URL from row (if already present)
 
-Output:
-- CSV with updated summary + recovery_method
+Key design choices:
+- lower acceptance threshold (closer to your old script)
+- no repeated retries on weak HTTP 200 results
+- retries only for 429 / 5xx / request exceptions
+- reduced candidate explosion
+- robust Chromium / ChromeDriver path detection
 
-Colab example:
-python scripts/recover_manual_queue.py \
-  --mount-drive \
-  --input-file "/content/drive/MyDrive/CI2/db/qwass2/collector_manual_queue_20260317_042544.csv"
+Colab:
+1) mount drive in a notebook cell first
+2) run:
+   !python scripts/recover_manual_queue.py --limit 10
 """
 
 import argparse
@@ -30,11 +37,12 @@ import html
 import os
 import random
 import re
+import shutil
 import time
 import urllib.parse
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import requests
@@ -59,7 +67,6 @@ except Exception:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Recover missing article summaries in manual queue")
-    parser.add_argument("--mount-drive", action="store_true", help="Mount Google Drive when running in Colab")
     parser.add_argument(
         "--env-path",
         default="/content/drive/MyDrive/CI2/ci2_keys.env",
@@ -76,8 +83,8 @@ def parse_args():
         help="Output CSV. If omitted, auto-generates next to input."
     )
     parser.add_argument("--limit", type=int, default=None, help="Only process first N rows")
-    parser.add_argument("--sleep-between-rows", type=float, default=8.0)
-    parser.add_argument("--jitter", type=float, default=3.0)
+    parser.add_argument("--sleep-between-rows", type=float, default=2.0)
+    parser.add_argument("--jitter", type=float, default=1.0)
     parser.add_argument("--disable-selenium-fallback", action="store_true")
     return parser.parse_args()
 
@@ -87,18 +94,21 @@ def parse_args():
 # =========================================================
 
 SHORT_SUMMARY_MAX = 50
-MIN_ACCEPT_CHARS = 350
-MIN_ACCEPT_WORDS = 80
+
+# More permissive, like the old script
+MIN_ACCEPT_CHARS = 200
+MIN_ACCEPT_WORDS = 40
 
 DIFFBOT_API = "https://api.diffbot.com/v3/article"
 REQUEST_TIMEOUT_S = 45
 
-DIFFBOT_MAX_RETRIES = 4
+# Reduced retries
+DIFFBOT_MAX_RETRIES = 3
 DIFFBOT_BACKOFF_BASE_S = 8
-DIFFBOT_PER_CALL_SLEEP_S = 3.0
+DIFFBOT_PER_CALL_SLEEP_S = 2.0
 
 REMOVEPAYWALL_WAIT_AFTER_CLICK = 10
-REMOVEPAYWALL_ARTICLE_MIN_WORDS = 80
+REMOVEPAYWALL_ARTICLE_MIN_WORDS = 50
 
 ARCHIVE_SNAPSHOT_COLUMNS = [
     "archive_snapshot_url",
@@ -137,7 +147,7 @@ FT_PAYWALL_MARKERS = [
     "discover all the plans",
     "ft professional",
     "why the ft",
-    "over a million readers pay to read the financial times",
+    "see why over a million readers pay to read the financial times",
 ]
 
 BLOOMBERG_JUNK_MARKERS = [
@@ -159,16 +169,6 @@ ARCHIVE_CHALLENGE_MARKERS = [
 # =========================================================
 # HELPERS
 # =========================================================
-
-def mount_drive_if_requested(do_mount: bool):
-    if not do_mount:
-        return
-    try:
-        from google.colab import drive
-        drive.mount("/content/drive", force_remount=True)
-    except Exception as e:
-        raise RuntimeError(f"Failed to mount Google Drive: {e}")
-
 
 def safe_text(v) -> str:
     if v is None:
@@ -207,7 +207,7 @@ def good_article_text(text: str) -> bool:
 def looks_like_ft_paywall(text: str) -> bool:
     t = safe_text(text).lower()
     hits = sum(1 for m in FT_PAYWALL_MARKERS if m in t)
-    return hits >= 2 or ("subscribe" in t and "financial times" in t and "digital" in t)
+    return hits >= 2 or ("subscribe" in t and "digital" in t and "financial times" in t)
 
 
 def looks_like_bbg_junk(text: str) -> bool:
@@ -253,29 +253,18 @@ def clean_extracted_text(text: str) -> str:
 
 
 def amp_variants(url: str) -> List[str]:
+    """
+    Keep only the most useful AMP variant to avoid candidate explosion.
+    """
     url = safe_text(url)
     if not url:
         return []
 
     out = []
-
     if "output=amp" not in url:
         sep = "&" if "?" in url else "?"
         out.append(url + f"{sep}output=amp")
-
-    if not url.endswith("/amp"):
-        out.append(url.rstrip("/") + "/amp")
-
-    if "://www." in url:
-        out.append(url.replace("://www.", "://amp."))
-
-    seen = set()
-    final = []
-    for u in out:
-        if u not in seen:
-            seen.add(u)
-            final.append(u)
-    return final
+    return out
 
 
 def wayback_latest(url: str) -> str:
@@ -355,6 +344,10 @@ def fetch_diffbot_text_once(url: str, token: str) -> Tuple[str, int]:
 
 
 def fetch_diffbot_text(url: str, token: str) -> str:
+    """
+    Important change: if Diffbot returns HTTP 200 with some text, do not keep retrying
+    weak results forever. That behavior was causing 429 storms.
+    """
     for attempt in range(1, DIFFBOT_MAX_RETRIES + 1):
         try:
             text, status = fetch_diffbot_text_once(url, token)
@@ -363,12 +356,8 @@ def fetch_diffbot_text(url: str, token: str) -> str:
                 if good_article_text(text) and not looks_like_ft_paywall(text) and not looks_like_bbg_junk(text):
                     return text
 
-                if attempt < DIFFBOT_MAX_RETRIES:
-                    wait = DIFFBOT_BACKOFF_BASE_S * attempt
-                    print(f"   ↻ Diffbot partial/weak result for {url} — retrying in {wait}s ({attempt}/{DIFFBOT_MAX_RETRIES})")
-                    time.sleep(wait)
-                    continue
-
+                # Old-script-style behavior: if we got a 200 response with something,
+                # move on instead of burning the API with more retries.
                 return text
 
             if status in (429, 500, 502, 503, 504):
@@ -434,8 +423,29 @@ def build_chrome_driver():
     display = Display(visible=0, size=(1920, 1080))
     display.start()
 
+    chromium_candidates = [
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        shutil.which("google-chrome"),
+    ]
+    chromedriver_candidates = [
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+        shutil.which("chromedriver"),
+    ]
+
+    chromium_path = next((p for p in chromium_candidates if p and os.path.exists(p)), None)
+    chromedriver_path = next((p for p in chromedriver_candidates if p and os.path.exists(p)), None)
+
+    if not chromium_path:
+        raise RuntimeError("Could not find chromium binary")
+    if not chromedriver_path:
+        raise RuntimeError("Could not find chromedriver binary")
+
     options = ChromeOptions()
-    options.binary_location = "/usr/bin/chromium"
+    options.binary_location = chromium_path
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
@@ -446,7 +456,7 @@ def build_chrome_driver():
     options.add_argument("--no-default-browser-check")
     options.add_argument("--disable-software-rasterizer")
 
-    service = ChromeService(executable_path="/usr/bin/chromedriver")
+    service = ChromeService(executable_path=chromedriver_path)
     driver = webdriver.Chrome(service=service, options=options)
 
     return driver, display
@@ -517,29 +527,75 @@ def recover_article(
     """
     Returns (text, method_used)
     """
+
     url = safe_text(url)
     title = safe_text(title)
     source = safe_text(source)
 
-    # A) FT: syndication first
-    if "ft.com" in url or "financialtimes.com" in url:
+    bbg_or_ft = is_bbg_or_ft(url, source)
+
+    # -------------------------------------------------
+    # FAST PATH FOR BLOOMBERG / FT
+    # -------------------------------------------------
+    if bbg_or_ft:
+        # 1) Syndication first
         alt = find_syndicated_url_by_title(title)
         if alt:
-            print(f"   🔎 FT syndicated copy first: {alt}")
+            print(f"   🔎 Fast-path syndicated copy: {alt}")
             text = fetch_diffbot_text(alt, token)
             if good_article_text(text):
                 return text, f"syndicated:{alt}"
 
-    # B) Direct Diffbot chain
+        # 2) Direct archive snapshot URL from row if present
+        if archive_snapshot_url:
+            print(f"   🗂️ Fast-path archive snapshot URL: {archive_snapshot_url}")
+            text = fetch_archive_snapshot_text(archive_snapshot_url)
+            if good_article_text(text):
+                return text, f"archive:{archive_snapshot_url}"
+
+        # 3) Canonical URL
+        print(f"   🤖 Diffbot candidate: {url}")
+        text = fetch_diffbot_text(url, token)
+        if good_article_text(text) and not looks_like_ft_paywall(text) and not looks_like_bbg_junk(text):
+            return text, f"diffbot:{url}"
+
+        # 4) Single AMP variant only
+        for cand in amp_variants(url):
+            print(f"   🤖 Diffbot AMP candidate: {cand}")
+            text = fetch_diffbot_text(cand, token)
+            if good_article_text(text) and not looks_like_ft_paywall(text) and not looks_like_bbg_junk(text):
+                return text, f"diffbot:{cand}"
+
+        # 5) Wayback
+        wb = wayback_latest(url)
+        print(f"   🤖 Diffbot Wayback candidate: {wb}")
+        text = fetch_diffbot_text(wb, token)
+        if good_article_text(text):
+            return text, f"diffbot:{wb}"
+
+        # 6) Selenium fallback last
+        if use_selenium_fallback:
+            print("   ↩️ Falling back to RemovePaywall (Chromium)...")
+            try:
+                text = fetch_via_removepaywall(url)
+                if good_article_text(text):
+                    return text, "removepaywall"
+            except Exception as e:
+                print(f"   ⚠️ Selenium fallback failed: {e}")
+
+        return "", ""
+
+    # -------------------------------------------------
+    # DEFAULT PATH FOR EVERYTHING ELSE
+    # -------------------------------------------------
     candidates = [url] + amp_variants(url) + [wayback_latest(url)]
+
     for cand in candidates:
         print(f"   🤖 Diffbot candidate: {cand}")
         text = fetch_diffbot_text(cand, token)
-
-        if good_article_text(text) and not looks_like_ft_paywall(text) and not looks_like_bbg_junk(text):
+        if good_article_text(text):
             return text, f"diffbot:{cand}"
 
-    # C) Syndication fallback for everyone
     alt = find_syndicated_url_by_title(title)
     if alt:
         print(f"   🔎 Trying syndicated copy: {alt}")
@@ -547,22 +603,11 @@ def recover_article(
         if good_article_text(text):
             return text, f"syndicated:{alt}"
 
-    # D) Manual archive snapshot URL, if already present in row
     if archive_snapshot_url:
         print(f"   🗂️ Trying archive snapshot URL: {archive_snapshot_url}")
         text = fetch_archive_snapshot_text(archive_snapshot_url)
         if good_article_text(text):
             return text, f"archive:{archive_snapshot_url}"
-
-    # E) Selenium fallback for Bloomberg / FT only
-    if use_selenium_fallback and is_bbg_or_ft(url, source):
-        print("   ↩️ Falling back to RemovePaywall (Chromium)...")
-        try:
-            text = fetch_via_removepaywall(url)
-            if good_article_text(text):
-                return text, "removepaywall"
-        except Exception as e:
-            print(f"   ⚠️ Selenium fallback failed: {e}")
 
     return "", ""
 
@@ -574,9 +619,7 @@ def recover_article(
 def main():
     args = parse_args()
 
-    mount_drive_if_requested(args.mount_drive)
     load_dotenv(args.env_path)
-
     token = os.getenv("DIFFBOT_KEY") or os.getenv("DIFFBOT_TOKEN")
     if not token:
         raise ValueError(f"❌ Missing DIFFBOT_KEY / DIFFBOT_TOKEN in {args.env_path}")
