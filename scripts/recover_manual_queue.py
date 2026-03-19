@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-CI2 • Manual Queue Recovery (hardened version)
+CI2 • Manual Queue Recovery (hardened)
 
 What it does
 - reads a manual queue CSV
@@ -19,24 +19,16 @@ Important
 - Do NOT mount Drive inside this script.
 - Mount Drive in Colab first, then run with !python.
 - Default input is your FIRST PASS recovered file.
-- This version adds:
-    - stronger Bloomberg anti-bot junk rejection
-    - optional self-bootstrap for Selenium dependencies
-    - safer Selenium acceptance
-    - optional recovery log CSV
-    - --selenium-only and --skip-diffbot modes
+- This version HARD-REJECTS Bloomberg anti-bot / challenge pages.
 """
 
 import argparse
-import csv
 import html
-import importlib
 import os
 import random
 import re
 import shutil
 import subprocess
-import sys
 import time
 import urllib.parse
 from datetime import datetime
@@ -47,6 +39,17 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+# Optional selenium imports
+try:
+    from pyvirtualdisplay import Display
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.chrome.service import Service as ChromeService
+    SELENIUM_AVAILABLE = True
+except Exception:
+    SELENIUM_AVAILABLE = False
 
 
 # =========================================================
@@ -117,23 +120,18 @@ BLOOMBERG_JUNK_MARKERS = [
     "customer support",
 ]
 
-# Stronger Bloomberg / anti-bot garbage detection
-BLOOMBERG_ANTIBOT_MARKERS = [
+# Hard reject markers for the Bloomberg challenge page / anti-bot page
+BLOOMBERG_CHALLENGE_MARKERS = [
     "we've detected unusual activity",
     "we have detected unusual activity",
-    "from your computer network",
     "to continue, please click the box below",
     "let us know you're not a robot",
-    "let us know you are not a robot",
+    "let us know you’re not a robot",
     "please make sure your browser supports javascript and cookies",
-    "you are not blocking them from loading",
-    "for more information you can review our terms of service",
-    "please complete the security check",
-    "verify you are human",
-    "verify that you are human",
-    "press and hold",
-    "cf-chl",
-    "attention required",
+    "please make sure your browser supports javascript",
+    "why did this happen?",
+    "for more information you can review our",
+    "need help? contact us",
 ]
 
 ARCHIVE_CHALLENGE_MARKERS = [
@@ -161,18 +159,6 @@ HEADERS = {
 
 
 # =========================================================
-# GLOBALS FOR OPTIONAL SELENIUM
-# =========================================================
-
-SELENIUM_AVAILABLE = False
-Display = None
-webdriver = None
-By = None
-ChromeOptions = None
-ChromeService = None
-
-
-# =========================================================
 # ARGUMENTS
 # =========================================================
 
@@ -193,11 +179,6 @@ def parse_args():
         "--output-file",
         default="",
         help="Output CSV. If omitted, auto-generates next to input.",
-    )
-    parser.add_argument(
-        "--log-file",
-        default="",
-        help="Optional recovery log CSV. If omitted, auto-generates next to output.",
     )
     parser.add_argument(
         "--limit",
@@ -223,19 +204,9 @@ def parse_args():
         help="Disable RemovePaywall Selenium fallback",
     )
     parser.add_argument(
-        "--bootstrap-selenium",
+        "--install-selenium-deps",
         action="store_true",
-        help="Attempt to install/import Selenium + pyvirtualdisplay automatically",
-    )
-    parser.add_argument(
-        "--selenium-only",
-        action="store_true",
-        help="Skip RSS / Diffbot / archive and try only Selenium fallback on eligible rows",
-    )
-    parser.add_argument(
-        "--skip-diffbot",
-        action="store_true",
-        help="Skip Diffbot attempts but still allow RSS resolution, archive, and Selenium fallback",
+        help="Attempt to pip install selenium + pyvirtualdisplay if missing",
     )
 
     return parser.parse_args()
@@ -331,10 +302,9 @@ def looks_like_bbg_junk(text: str) -> bool:
     return any(m in t for m in BLOOMBERG_JUNK_MARKERS)
 
 
-def looks_like_bbg_antibot(text: str) -> bool:
+def looks_like_bbg_challenge(text: str) -> bool:
     t = safe_text(text).lower()
-    hits = sum(1 for m in BLOOMBERG_ANTIBOT_MARKERS if m in t)
-    return hits >= 2
+    return any(m in t for m in BLOOMBERG_CHALLENGE_MARKERS)
 
 
 def looks_like_archive_challenge(text: str) -> bool:
@@ -342,26 +312,13 @@ def looks_like_archive_challenge(text: str) -> bool:
     return any(m in t for m in ARCHIVE_CHALLENGE_MARKERS)
 
 
-def is_reject_text(text: str) -> Tuple[bool, str]:
-    if not safe_text(text):
-        return True, "empty"
-
-    if looks_like_ft_paywall(text):
-        return True, "ft_paywall"
-
-    if looks_like_bbg_junk(text):
-        return True, "bloomberg_junk"
-
-    if looks_like_bbg_antibot(text):
-        return True, "bloomberg_antibot"
-
-    if looks_like_archive_challenge(text):
-        return True, "archive_challenge"
-
-    if not good_article_text(text):
-        return True, "too_short"
-
-    return False, ""
+def is_bad_extracted_text(text: str) -> bool:
+    return (
+        looks_like_ft_paywall(text)
+        or looks_like_bbg_junk(text)
+        or looks_like_bbg_challenge(text)
+        or looks_like_archive_challenge(text)
+    )
 
 
 def get_first_present(row: Dict, cols: List[str]) -> str:
@@ -399,72 +356,6 @@ def amp_variants(url: str) -> List[str]:
 
 def wayback_latest(url: str) -> str:
     return f"https://web.archive.org/web/0/{url}"
-
-
-# =========================================================
-# LOGGING
-# =========================================================
-
-def init_log(log_path: str):
-    fieldnames = [
-        "timestamp",
-        "row_index",
-        "title",
-        "url",
-        "before_chars",
-        "attempted_methods",
-        "final_status",
-        "final_method",
-        "final_chars",
-        "reject_reason",
-    ]
-    with open(log_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-
-
-def append_log(
-    log_path: str,
-    row_index: int,
-    title: str,
-    url: str,
-    before_chars: int,
-    attempted_methods: List[str],
-    final_status: str,
-    final_method: str,
-    final_chars: int,
-    reject_reason: str,
-):
-    with open(log_path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "timestamp",
-                "row_index",
-                "title",
-                "url",
-                "before_chars",
-                "attempted_methods",
-                "final_status",
-                "final_method",
-                "final_chars",
-                "reject_reason",
-            ],
-        )
-        writer.writerow(
-            {
-                "timestamp": datetime.now().isoformat(),
-                "row_index": row_index,
-                "title": title,
-                "url": url,
-                "before_chars": before_chars,
-                "attempted_methods": " | ".join(attempted_methods),
-                "final_status": final_status,
-                "final_method": final_method,
-                "final_chars": final_chars,
-                "reject_reason": reject_reason,
-            }
-        )
 
 
 # =========================================================
@@ -600,13 +491,7 @@ def fetch_diffbot_text(url: str, token: str) -> str:
     return ""
 
 
-def best_text_via_diffbot(
-    original_url: str,
-    original_title: str,
-    token: str,
-    attempted_methods: List[str],
-    skip_diffbot: bool = False,
-) -> Tuple[str, str]:
+def best_text_via_diffbot(original_url: str, original_title: str, token: str) -> Tuple[str, str]:
     """
     Old-script style:
     1) syndicated copy by title
@@ -617,16 +502,10 @@ def best_text_via_diffbot(
     if original_title:
         alt = find_syndicated_url_by_title(original_title)
         if alt:
-            attempted_methods.append(f"syndication:{alt}")
             print(f"   🔎 Fast-path syndicated copy: {alt}")
-            if not skip_diffbot:
-                text = fetch_diffbot_text(alt, token)
-                reject, _ = is_reject_text(text)
-                if not reject:
-                    return text, f"syndicated:{alt}"
-
-    if skip_diffbot:
-        return "", ""
+            text = fetch_diffbot_text(alt, token)
+            if good_article_text(text) and not is_bad_extracted_text(text):
+                return text, f"syndicated:{alt}"
 
     candidates = [original_url] + amp_variants(original_url) + [wayback_latest(original_url)]
 
@@ -637,12 +516,10 @@ def best_text_via_diffbot(
         elif "web.archive.org/web/0/" in cand:
             label = "Diffbot Wayback candidate"
 
-        attempted_methods.append(f"diffbot:{cand}")
         print(f"   🤖 {label}: {cand}")
         text = fetch_diffbot_text(cand, token)
-        reject, _ = is_reject_text(text)
 
-        if not reject:
+        if good_article_text(text) and not is_bad_extracted_text(text):
             return text, f"diffbot:{cand}"
 
     return "", ""
@@ -677,7 +554,7 @@ def fetch_archive_snapshot_text(snapshot_url: str) -> str:
         )
         text = clean_extracted_text(text)
 
-        if looks_like_archive_challenge(text):
+        if is_bad_extracted_text(text):
             return ""
 
         return text
@@ -688,149 +565,76 @@ def fetch_archive_snapshot_text(snapshot_url: str) -> str:
 
 
 # =========================================================
-# SELENIUM / REMOVEPAYWALL BOOTSTRAP
-# =========================================================
-
-def run_cmd(cmd: List[str], check: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
-
-
-def import_selenium_modules() -> bool:
-    global SELENIUM_AVAILABLE, Display, webdriver, By, ChromeOptions, ChromeService
-
-    try:
-        from pyvirtualdisplay import Display as _Display
-        from selenium import webdriver as _webdriver
-        from selenium.webdriver.common.by import By as _By
-        from selenium.webdriver.chrome.options import Options as _ChromeOptions
-        from selenium.webdriver.chrome.service import Service as _ChromeService
-
-        Display = _Display
-        webdriver = _webdriver
-        By = _By
-        ChromeOptions = _ChromeOptions
-        ChromeService = _ChromeService
-        SELENIUM_AVAILABLE = True
-        return True
-    except Exception:
-        SELENIUM_AVAILABLE = False
-        return False
-
-
-def ensure_python_package(pkg_name: str, import_name: Optional[str] = None) -> bool:
-    import_name = import_name or pkg_name
-    try:
-        importlib.import_module(import_name)
-        return True
-    except Exception:
-        pass
-
-    print(f"   ⚙️ Installing Python package: {pkg_name}")
-    try:
-        run_cmd([sys.executable, "-m", "pip", "install", "-q", pkg_name], check=True)
-        importlib.import_module(import_name)
-        return True
-    except Exception as e:
-        print(f"   ⚠️ Failed to install {pkg_name}: {e}")
-        return False
-
-
-def executable_works(path: str, version_args: Optional[List[str]] = None) -> bool:
-    if not path:
-        return False
-    if not os.path.isfile(path):
-        return False
-    if not os.access(path, os.X_OK):
-        return False
-
-    version_args = version_args or ["--version"]
-    try:
-        result = run_cmd([path] + version_args)
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def find_working_browser_binary() -> Optional[str]:
-    candidates = [
-        shutil.which("google-chrome-stable"),
-        shutil.which("google-chrome"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
-        "/opt/google/chrome/chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-    ]
-
-    for c in candidates:
-        if c and executable_works(c):
-            return c
-    return None
-
-
-def find_working_chromedriver_binary() -> Optional[str]:
-    candidates = [
-        shutil.which("chromedriver"),
-        "/usr/bin/chromedriver",
-        "/usr/lib/chromium-browser/chromedriver",
-        "/usr/lib/chromium/chromedriver",
-    ]
-
-    for c in candidates:
-        if c and executable_works(c):
-            return c
-    return None
-
-
-def maybe_install_system_browser_bits() -> None:
-    apt = shutil.which("apt-get")
-    if not apt:
-        print("   ⚠️ apt-get not available; skipping system package install")
-        return
-
-    print("   ⚙️ Attempting system install for browser dependencies")
-    install_attempts = [
-        ["apt-get", "update"],
-        ["apt-get", "install", "-y", "xvfb", "chromium", "chromium-driver"],
-        ["apt-get", "install", "-y", "xvfb", "chromium-browser", "chromium-chromedriver"],
-    ]
-
-    # run update once
-    try:
-        run_cmd(install_attempts[0], check=False)
-    except Exception:
-        pass
-
-    for cmd in install_attempts[1:]:
-        try:
-            result = run_cmd(cmd, check=False)
-            if result.returncode == 0:
-                break
-        except Exception:
-            continue
-
-
-def bootstrap_selenium_environment(allow_bootstrap: bool) -> None:
-    if import_selenium_modules():
-        return
-
-    if not allow_bootstrap:
-        return
-
-    ok1 = ensure_python_package("selenium")
-    ok2 = ensure_python_package("pyvirtualdisplay")
-
-    if ok1 and ok2:
-        import_selenium_modules()
-
-    maybe_install_system_browser_bits()
-
-
-# =========================================================
 # SELENIUM / REMOVEPAYWALL
 # =========================================================
+
+def maybe_install_selenium_deps():
+    """
+    Lightweight pip install helper. This cannot install Chrome itself.
+    It only helps if selenium / pyvirtualdisplay are missing.
+    """
+    packages = ["selenium", "pyvirtualdisplay"]
+    try:
+        subprocess.run(
+            ["python", "-m", "pip", "install", "-q"] + packages,
+            check=True,
+        )
+        print("✅ Installed selenium Python deps")
+    except Exception as e:
+        print(f"⚠️ Could not install selenium deps automatically: {e}")
+
+
+def find_existing_path(candidates: List[Optional[str]]) -> Optional[str]:
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def validate_browser_stack(chromium_path: str, chromedriver_path: str) -> Tuple[bool, str]:
+    """
+    Quick sanity checks before Selenium tries to launch.
+    """
+    if not os.path.exists(chromium_path):
+        return False, f"chrome binary not found: {chromium_path}"
+    if not os.path.exists(chromedriver_path):
+        return False, f"chromedriver not found: {chromedriver_path}"
+
+    try:
+        chrome_v = subprocess.run(
+            [chromium_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        chrome_out = (chrome_v.stdout or chrome_v.stderr or "").strip()
+    except Exception as e:
+        return False, f"could not run chrome binary: {e}"
+
+    try:
+        driver_v = subprocess.run(
+            [chromedriver_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        driver_out = (driver_v.stdout or driver_v.stderr or "").strip()
+    except Exception as e:
+        return False, f"could not run chromedriver: {e}"
+
+    if "requires the chromium snap" in driver_out.lower():
+        return False, (
+            "chromedriver points to snap-wrapper stub, not real driver. "
+            "Need real chromedriver binary."
+        )
+
+    if not chrome_out:
+        return False, "chrome binary did not return a version string"
+    if not driver_out:
+        return False, "chromedriver did not return a version string"
+
+    return True, f"{chrome_out} | {driver_out}"
+
 
 def build_chrome_driver():
     if not SELENIUM_AVAILABLE:
@@ -839,22 +643,40 @@ def build_chrome_driver():
     display = Display(visible=0, size=(1920, 1080))
     display.start()
 
-    chromium_path = find_working_browser_binary()
-    chromedriver_path = find_working_chromedriver_binary()
+    chromium_candidates = [
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    chromedriver_candidates = [
+        shutil.which("chromedriver"),
+        "/usr/bin/chromedriver",
+        "/usr/lib/chromium-browser/chromedriver",
+        "/usr/lib/chromium/chromedriver",
+    ]
+
+    chromium_path = find_existing_path(chromium_candidates)
+    chromedriver_path = find_existing_path(chromedriver_candidates)
 
     if not chromium_path:
         raise RuntimeError(
-            "Could not find a working Chrome/Chromium binary. "
-            "Checked common paths, but none executed successfully."
+            "Could not find chromium/google-chrome binary. "
+            "You still need a real browser in the runtime."
         )
     if not chromedriver_path:
         raise RuntimeError(
-            "Could not find a working chromedriver binary. "
-            "Checked common paths, but none executed successfully."
+            "Could not find chromedriver binary. "
+            "You still need a real chromedriver in the runtime."
         )
 
-    print(f"   🧭 Browser binary: {chromium_path}")
-    print(f"   🧭 Chromedriver: {chromedriver_path}")
+    ok, msg = validate_browser_stack(chromium_path, chromedriver_path)
+    if not ok:
+        raise RuntimeError(msg)
 
     options = ChromeOptions()
     options.binary_location = chromium_path
@@ -903,13 +725,55 @@ def fetch_via_removepaywall(url: str) -> str:
             pass
 
         raw_text = driver.find_element(By.TAG_NAME, "body").text
+
+        header_trash = [
+            "Skip to content",
+            "Bloomberg the Company",
+            "Sign In",
+            "Subscribe",
+            "Live TV",
+            "Markets",
+            "Opinion",
+            "US Edition",
+        ]
+        footer_trash_starts = [
+            "Get Alerts for:",
+            "Submit a Tip",
+            "Explore Offers",
+            "Terms of Service",
+            "Trademarks",
+            "Advertise",
+            "Subscribe now",
+            "Help",
+            "Made in NYC",
+            "©",
+        ]
+        mid_trash = [
+            "Photographer:",
+            "Gift this article",
+            "Share feedback",
+            "Get in Touch",
+            "Before it’s here, it’s on the Bloomberg Terminal",
+            "Before it's here, it's on the Bloomberg Terminal",
+            "Bloomberg Terminal LEARN MORE",
+        ]
+
+        for junk in header_trash:
+            if junk in raw_text:
+                raw_text = raw_text.split(junk, 1)[-1]
+
+        for junk in footer_trash_starts:
+            if junk in raw_text:
+                raw_text = raw_text.split(junk, 1)[0]
+
+        for junk in mid_trash:
+            raw_text = raw_text.replace(junk, "")
+
         cleaned = clean_extracted_text(raw_text)
 
-        reject, _ = is_reject_text(cleaned)
-        if reject:
-            return ""
-
         if len(cleaned.split()) < REMOVEPAYWALL_ARTICLE_MIN_WORDS:
+            return ""
+        if is_bad_extracted_text(cleaned):
             return ""
 
         return cleaned
@@ -926,131 +790,22 @@ def fetch_via_removepaywall(url: str) -> str:
 
 
 # =========================================================
-# RECOVERY LOGIC
-# =========================================================
-
-def recover_article(
-    url: str,
-    title: str,
-    source: str,
-    token: str,
-    archive_snapshot_url: str = "",
-    use_selenium_fallback: bool = True,
-    selenium_only: bool = False,
-    skip_diffbot: bool = False,
-) -> Tuple[str, str, List[str], str]:
-    """
-    Returns:
-        text,
-        method_used,
-        attempted_methods,
-        reject_reason
-    """
-    attempted_methods: List[str] = []
-    last_reject_reason = ""
-
-    url = safe_text(url)
-    title = safe_text(title)
-    source = safe_text(source)
-
-    bbg_or_ft = is_bbg_or_ft(url, source)
-
-    if selenium_only:
-        if use_selenium_fallback and bbg_or_ft:
-            attempted_methods.append("removepaywall")
-            print("   ↩️ Selenium-only mode: RemovePaywall (Chromium)...")
-            try:
-                text = fetch_via_removepaywall(url)
-                reject, reason = is_reject_text(text)
-                if not reject:
-                    return text, "removepaywall_valid", attempted_methods, ""
-                last_reject_reason = reason or "selenium_rejected"
-            except Exception as e:
-                last_reject_reason = f"selenium_error:{type(e).__name__}"
-                print(f"   ⚠️ Selenium fallback failed: {e}")
-        return "", "", attempted_methods, last_reject_reason or "selenium_only_no_hit"
-
-    # -------------------------------------------------
-    # FAST PATH FOR BLOOMBERG / FT
-    # -------------------------------------------------
-    if bbg_or_ft:
-        # 1) syndication + diffbot
-        if not skip_diffbot:
-            text, method = best_text_via_diffbot(url, title, token, attempted_methods, skip_diffbot=False)
-            if text:
-                reject, reason = is_reject_text(text)
-                if not reject:
-                    return text, method, attempted_methods, ""
-                last_reject_reason = reason
-
-        # 2) direct archive snapshot from row
-        if archive_snapshot_url:
-            attempted_methods.append(f"archive:{archive_snapshot_url}")
-            print(f"   🗂️ Fast-path archive snapshot URL: {archive_snapshot_url}")
-            text = fetch_archive_snapshot_text(archive_snapshot_url)
-            reject, reason = is_reject_text(text)
-            if not reject:
-                return text, f"archive:{archive_snapshot_url}", attempted_methods, ""
-            last_reject_reason = reason
-
-        # 3) selenium last
-        if use_selenium_fallback:
-            attempted_methods.append("removepaywall")
-            print("   ↩️ Falling back to RemovePaywall (Chromium)...")
-            try:
-                text = fetch_via_removepaywall(url)
-                reject, reason = is_reject_text(text)
-                if not reject:
-                    return text, "removepaywall_valid", attempted_methods, ""
-                last_reject_reason = reason or "selenium_rejected"
-            except Exception as e:
-                last_reject_reason = f"selenium_error:{type(e).__name__}"
-                print(f"   ⚠️ Selenium fallback failed: {e}")
-
-        return "", "", attempted_methods, last_reject_reason or "no_hit"
-
-    # -------------------------------------------------
-    # DEFAULT PATH FOR EVERYTHING ELSE
-    # -------------------------------------------------
-    if not skip_diffbot:
-        text, method = best_text_via_diffbot(url, title, token, attempted_methods, skip_diffbot=False)
-        if text:
-            reject, reason = is_reject_text(text)
-            if not reject:
-                return text, method, attempted_methods, ""
-            last_reject_reason = reason
-
-    else:
-        # still try to resolve syndication for visibility, but do not diffbot it
-        alt = find_syndicated_url_by_title(title)
-        if alt:
-            attempted_methods.append(f"syndication_resolved:{alt}")
-
-    if archive_snapshot_url:
-        attempted_methods.append(f"archive:{archive_snapshot_url}")
-        print(f"   🗂️ Trying archive snapshot URL: {archive_snapshot_url}")
-        text = fetch_archive_snapshot_text(archive_snapshot_url)
-        reject, reason = is_reject_text(text)
-        if not reject:
-            return text, f"archive:{archive_snapshot_url}", attempted_methods, ""
-        last_reject_reason = reason
-
-    return "", "", attempted_methods, last_reject_reason or "no_hit"
-
-
-# =========================================================
 # MAIN
 # =========================================================
 
 def main():
     args = parse_args()
 
-    bootstrap_selenium_environment(args.bootstrap_selenium)
+    if args.install_selenium_deps:
+        maybe_install_selenium_deps()
 
     load_dotenv(args.env_path)
     token = os.getenv("DIFFBOT_KEY") or os.getenv("DIFFBOT_TOKEN")
     if not token:
         raise ValueError(f"❌ Missing DIFFBOT_KEY / DIFFBOT_TOKEN in {args.env_path}")
+
+    print("✅ Diffbot token loaded:", token[:6] + "...")
+    print(f"📥 Input file: {args.input_file}")
 
     input_file = args.input_file
     if not args.output_file:
@@ -1059,16 +814,6 @@ def main():
         output_file = str(input_path.with_name(f"{input_path.stem}_RECOVERED_{stamp}.csv"))
     else:
         output_file = args.output_file
-
-    if not args.log_file:
-        output_path = Path(output_file)
-        log_file = str(output_path.with_name(f"{output_path.stem}__recovery_log.csv"))
-    else:
-        log_file = args.log_file
-
-    print("✅ Diffbot token loaded:", token[:6] + "...")
-    print(f"📥 Input file: {input_file}")
-    print(f"📝 Log file:   {log_file}")
 
     df = pd.read_csv(input_file)
 
@@ -1093,8 +838,6 @@ def main():
     print(f"Rows loaded: {len(df)}")
     print(f"Rows with summary < {SHORT_SUMMARY_MAX} chars: {len(to_update_idx)}")
 
-    init_log(log_file)
-
     updated = 0
 
     for i in to_update_idx:
@@ -1107,73 +850,42 @@ def main():
         archive_snapshot_url = get_first_present(row, ARCHIVE_SNAPSHOT_COLUMNS)
 
         if not url:
-            append_log(
-                log_file,
-                i,
-                title,
-                url,
-                len(before),
-                [],
-                "skipped",
-                "",
-                0,
-                "missing_url",
-            )
             continue
 
         print(f"\n🔗 [{i}] {title}\n    {url}")
         print(f"   Before chars: {len(before)}")
 
-        text, method, attempted_methods, reject_reason = recover_article(
-            url=url,
-            title=title,
-            source=source,
-            token=token,
-            archive_snapshot_url=archive_snapshot_url,
-            use_selenium_fallback=(
-                USE_SELENIUM_FALLBACK_DEFAULT and not args.disable_selenium_fallback
-            ),
-            selenium_only=args.selenium_only,
-            skip_diffbot=args.skip_diffbot,
-        )
+        text, method = best_text_via_diffbot(url, title, token)
 
-        reject, reason = is_reject_text(text)
-        if reject:
-            reject_reason = reject_reason or reason
+        if not good_article_text(text) and archive_snapshot_url:
+            print(f"   🗂️ Trying archive snapshot URL: {archive_snapshot_url}")
+            archive_text = fetch_archive_snapshot_text(archive_snapshot_url)
+            if good_article_text(archive_text) and not is_bad_extracted_text(archive_text):
+                text = archive_text
+                method = f"archive:{archive_snapshot_url}"
 
-        if text and not reject:
+        if (
+            not good_article_text(text)
+            and USE_SELENIUM_FALLBACK_DEFAULT
+            and not args.disable_selenium_fallback
+            and is_bbg_or_ft(url, source)
+        ):
+            print("   ↩️ Falling back to RemovePaywall (Chromium)...")
+            try:
+                selenium_text = fetch_via_removepaywall(url) or ""
+                if good_article_text(selenium_text) and not is_bad_extracted_text(selenium_text):
+                    text = selenium_text
+                    method = "removepaywall"
+            except Exception as e:
+                print(f"   ⚠️ Selenium fallback failed: {e}")
+
+        if good_article_text(text) and not is_bad_extracted_text(text):
             df.at[i, "summary"] = text
             df.at[i, "recovery_method"] = method
             updated += 1
             print(f"   ✅ UPDATED → {title} | {method} | chars: {len(text)}")
-
-            append_log(
-                log_file,
-                i,
-                title,
-                url,
-                len(before),
-                attempted_methods,
-                "updated",
-                method,
-                len(text),
-                "",
-            )
         else:
-            print(f"   ❌ Skipped (only {len(text)} chars) | reason: {reject_reason or 'no_hit'}")
-
-            append_log(
-                log_file,
-                i,
-                title,
-                url,
-                len(before),
-                attempted_methods,
-                "skipped",
-                "",
-                len(text),
-                reject_reason or "no_hit",
-            )
+            print(f"   ❌ Skipped (only {len(text)} chars)")
 
         polite_row_sleep(args.sleep_between_rows, args.jitter)
 
@@ -1181,7 +893,6 @@ def main():
 
     print(f"\n🎯 Updated rows: {updated} / {len(to_update_idx)}")
     print(f"💾 Saved output:\n   {output_file}")
-    print(f"📝 Saved log:\n   {log_file}")
 
 
 if __name__ == "__main__":
