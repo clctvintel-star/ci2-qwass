@@ -120,7 +120,7 @@ BLOOMBERG_JUNK_MARKERS = [
     "customer support",
 ]
 
-# Hard reject markers for the Bloomberg challenge page / anti-bot page
+# Hard reject markers for Bloomberg challenge / anti-bot pages
 BLOOMBERG_CHALLENGE_MARKERS = [
     "we've detected unusual activity",
     "we have detected unusual activity",
