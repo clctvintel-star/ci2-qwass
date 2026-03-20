@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-CI2 • Manual Queue Recovery (hardened)
+CI2 • Manual Queue Recovery (hardened + real Diffbot throttling)
 
 What it does
 - reads a manual queue CSV
@@ -20,6 +20,12 @@ Important
 - Mount Drive in Colab first, then run with !python.
 - Default input is your FIRST PASS recovered file.
 - This version HARD-REJECTS Bloomberg anti-bot / challenge pages.
+
+Major fix in this version
+- Adds REAL per-request Diffbot throttling
+- Adds extra spacing between candidate URLs inside a row
+- Makes retry/backoff less bursty
+- Tracks Diffbot request counts in logs
 """
 
 import argparse
@@ -74,6 +80,14 @@ DIFFBOT_API = "https://api.diffbot.com/v3/article"
 REQUEST_TIMEOUT_S = 45
 DIFFBOT_MAX_RETRIES = 3
 DIFFBOT_BACKOFF_BASE_S = 8
+
+# NEW: real request-level Diffbot throttling
+DIFFBOT_MIN_INTERVAL_S = 3.5
+DIFFBOT_MIN_INTERVAL_JITTER_S = 0.75
+
+# NEW: small pause between candidate URLs within the same row
+DIFFBOT_CANDIDATE_PAUSE_S = 1.0
+DIFFBOT_CANDIDATE_PAUSE_JITTER_S = 0.5
 
 REMOVEPAYWALL_WAIT_AFTER_CLICK = 10
 REMOVEPAYWALL_ARTICLE_MIN_WORDS = 50
@@ -157,6 +171,13 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
+# =========================================================
+# GLOBAL RUNTIME STATE
+# =========================================================
+
+LAST_DIFFBOT_CALL_TS = 0.0
+DIFFBOT_CALL_COUNT = 0
+
 
 # =========================================================
 # ARGUMENTS
@@ -207,6 +228,30 @@ def parse_args():
         "--install-selenium-deps",
         action="store_true",
         help="Attempt to pip install selenium + pyvirtualdisplay if missing",
+    )
+    parser.add_argument(
+        "--diffbot-min-interval",
+        type=float,
+        default=DIFFBOT_MIN_INTERVAL_S,
+        help="Minimum seconds between ALL Diffbot requests",
+    )
+    parser.add_argument(
+        "--diffbot-min-interval-jitter",
+        type=float,
+        default=DIFFBOT_MIN_INTERVAL_JITTER_S,
+        help="Random extra seconds added to Diffbot min-interval sleeps",
+    )
+    parser.add_argument(
+        "--candidate-pause",
+        type=float,
+        default=DIFFBOT_CANDIDATE_PAUSE_S,
+        help="Pause between Diffbot candidate URLs within a row",
+    )
+    parser.add_argument(
+        "--candidate-pause-jitter",
+        type=float,
+        default=DIFFBOT_CANDIDATE_PAUSE_JITTER_S,
+        help="Random extra pause between candidate URLs within a row",
     )
 
     return parser.parse_args()
@@ -359,6 +404,36 @@ def wayback_latest(url: str) -> str:
 
 
 # =========================================================
+# DIFFBOT THROTTLING
+# =========================================================
+
+def throttle_diffbot(min_interval_s: float, jitter_s: float):
+    """
+    Enforce a global minimum gap between all Diffbot requests.
+    This is the critical fix missing from the prior version.
+    """
+    global LAST_DIFFBOT_CALL_TS
+
+    now = time.time()
+    elapsed = now - LAST_DIFFBOT_CALL_TS
+    min_wait = min_interval_s + random.uniform(0, jitter_s)
+    remaining = min_wait - elapsed
+
+    if remaining > 0:
+        print(f"   ⏳ Diffbot throttle sleep: {remaining:.2f}s")
+        time.sleep(remaining)
+
+    LAST_DIFFBOT_CALL_TS = time.time()
+
+
+def pause_between_candidates(base_s: float, jitter_s: float):
+    wait = base_s + random.uniform(0, jitter_s)
+    if wait > 0:
+        print(f"   ⏸️ Candidate pause: {wait:.2f}s")
+        time.sleep(wait)
+
+
+# =========================================================
 # GOOGLE NEWS RSS SYNDICATION
 # =========================================================
 
@@ -435,7 +510,16 @@ def find_syndicated_url_by_title(title: str) -> str:
 # DIFFBOT
 # =========================================================
 
-def fetch_diffbot_text_once(url: str, token: str) -> Tuple[str, int]:
+def fetch_diffbot_text_once(
+    url: str,
+    token: str,
+    min_interval_s: float,
+    jitter_s: float,
+) -> Tuple[str, int]:
+    global DIFFBOT_CALL_COUNT
+
+    throttle_diffbot(min_interval_s=min_interval_s, jitter_s=jitter_s)
+
     params = {
         "token": token,
         "url": url,
@@ -443,6 +527,10 @@ def fetch_diffbot_text_once(url: str, token: str) -> Tuple[str, int]:
         "render": "true",
         "useCanonical": "false",
     }
+
+    DIFFBOT_CALL_COUNT += 1
+    print(f"   📡 Diffbot request #{DIFFBOT_CALL_COUNT}: {url}")
+
     r = requests.get(DIFFBOT_API, params=params, timeout=REQUEST_TIMEOUT_S)
     status = r.status_code
 
@@ -462,21 +550,34 @@ def fetch_diffbot_text_once(url: str, token: str) -> Tuple[str, int]:
     return "", status
 
 
-def fetch_diffbot_text(url: str, token: str) -> str:
+def fetch_diffbot_text(
+    url: str,
+    token: str,
+    min_interval_s: float,
+    jitter_s: float,
+) -> str:
     """
     Retry only on 429 / 5xx / request exceptions.
     If Diffbot gives 200, return what it gave and let caller judge quality.
     """
     for attempt in range(1, DIFFBOT_MAX_RETRIES + 1):
         try:
-            text, status = fetch_diffbot_text_once(url, token)
+            text, status = fetch_diffbot_text_once(
+                url=url,
+                token=token,
+                min_interval_s=min_interval_s,
+                jitter_s=jitter_s,
+            )
 
             if status == 200:
                 return text
 
             if status in (429, 500, 502, 503, 504):
-                wait = DIFFBOT_BACKOFF_BASE_S * (2 ** (attempt - 1))
-                print(f"   ⚠️ Diffbot HTTP {status} for {url} — backoff {wait}s ({attempt}/{DIFFBOT_MAX_RETRIES})")
+                wait = DIFFBOT_BACKOFF_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 1.5)
+                print(
+                    f"   ⚠️ Diffbot HTTP {status} for {url} — "
+                    f"backoff {wait:.2f}s ({attempt}/{DIFFBOT_MAX_RETRIES})"
+                )
                 time.sleep(wait)
                 continue
 
@@ -484,32 +585,51 @@ def fetch_diffbot_text(url: str, token: str) -> str:
             return ""
 
         except requests.RequestException as e:
-            wait = DIFFBOT_BACKOFF_BASE_S * (2 ** (attempt - 1))
-            print(f"   ⚠️ Diffbot error {type(e).__name__} for {url} — backoff {wait}s ({attempt}/{DIFFBOT_MAX_RETRIES})")
+            wait = DIFFBOT_BACKOFF_BASE_S * (2 ** (attempt - 1)) + random.uniform(0, 1.5)
+            print(
+                f"   ⚠️ Diffbot error {type(e).__name__} for {url} — "
+                f"backoff {wait:.2f}s ({attempt}/{DIFFBOT_MAX_RETRIES})"
+            )
             time.sleep(wait)
 
     return ""
 
 
-def best_text_via_diffbot(original_url: str, original_title: str, token: str) -> Tuple[str, str]:
+def best_text_via_diffbot(
+    original_url: str,
+    original_title: str,
+    token: str,
+    diffbot_min_interval: float,
+    diffbot_min_interval_jitter: float,
+    candidate_pause: float,
+    candidate_pause_jitter: float,
+) -> Tuple[str, str]:
     """
-    Old-script style:
+    Order:
     1) syndicated copy by title
     2) original URL
     3) AMP variants
     4) Wayback pointer
     """
+
     if original_title:
         alt = find_syndicated_url_by_title(original_title)
         if alt:
             print(f"   🔎 Fast-path syndicated copy: {alt}")
-            text = fetch_diffbot_text(alt, token)
+            text = fetch_diffbot_text(
+                url=alt,
+                token=token,
+                min_interval_s=diffbot_min_interval,
+                jitter_s=diffbot_min_interval_jitter,
+            )
             if good_article_text(text) and not is_bad_extracted_text(text):
                 return text, f"syndicated:{alt}"
 
+            pause_between_candidates(candidate_pause, candidate_pause_jitter)
+
     candidates = [original_url] + amp_variants(original_url) + [wayback_latest(original_url)]
 
-    for cand in candidates:
+    for idx, cand in enumerate(candidates):
         label = "Diffbot candidate"
         if "output=amp" in cand or cand.endswith("/amp"):
             label = "Diffbot AMP candidate"
@@ -517,10 +637,18 @@ def best_text_via_diffbot(original_url: str, original_title: str, token: str) ->
             label = "Diffbot Wayback candidate"
 
         print(f"   🤖 {label}: {cand}")
-        text = fetch_diffbot_text(cand, token)
+        text = fetch_diffbot_text(
+            url=cand,
+            token=token,
+            min_interval_s=diffbot_min_interval,
+            jitter_s=diffbot_min_interval_jitter,
+        )
 
         if good_article_text(text) and not is_bad_extracted_text(text):
             return text, f"diffbot:{cand}"
+
+        if idx < len(candidates) - 1:
+            pause_between_candidates(candidate_pause, candidate_pause_jitter)
 
     return "", ""
 
@@ -806,6 +934,13 @@ def main():
 
     print("✅ Diffbot token loaded:", token[:6] + "...")
     print(f"📥 Input file: {args.input_file}")
+    print(
+        "🕒 Diffbot throttle config | "
+        f"min_interval={args.diffbot_min_interval}s "
+        f"+ jitter up to {args.diffbot_min_interval_jitter}s | "
+        f"candidate_pause={args.candidate_pause}s "
+        f"+ jitter up to {args.candidate_pause_jitter}s"
+    )
 
     input_file = args.input_file
     if not args.output_file:
@@ -855,7 +990,15 @@ def main():
         print(f"\n🔗 [{i}] {title}\n    {url}")
         print(f"   Before chars: {len(before)}")
 
-        text, method = best_text_via_diffbot(url, title, token)
+        text, method = best_text_via_diffbot(
+            original_url=url,
+            original_title=title,
+            token=token,
+            diffbot_min_interval=args.diffbot_min_interval,
+            diffbot_min_interval_jitter=args.diffbot_min_interval_jitter,
+            candidate_pause=args.candidate_pause,
+            candidate_pause_jitter=args.candidate_pause_jitter,
+        )
 
         if not good_article_text(text) and archive_snapshot_url:
             print(f"   🗂️ Trying archive snapshot URL: {archive_snapshot_url}")
@@ -892,6 +1035,7 @@ def main():
     df.to_csv(output_file, index=False)
 
     print(f"\n🎯 Updated rows: {updated} / {len(to_update_idx)}")
+    print(f"📡 Total Diffbot requests made: {DIFFBOT_CALL_COUNT}")
     print(f"💾 Saved output:\n   {output_file}")
 
 
