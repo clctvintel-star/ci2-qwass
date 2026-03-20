@@ -21,18 +21,15 @@ Design choices
 - one script
 - generic rescue flow, not routed by publication
 - publisher-specific logic is used only for junk/challenge/paywall rejection
-- saves to a NEW file by default
 - can overwrite input if you explicitly ask it to
 - supports both CSV and XLSX
 - supports configurable text column
 - tolerant of Colab / Jupyter extra kernel args
 
-Typical usage in Colab
+Typical Colab usage
 1) mount Drive first
 2) install deps if needed
-3) either:
-      !python recover_manual_queue_v2.py --input-file /path/to/file.csv
-   or paste this whole script into a Colab cell and run it after editing DEFAULT_INPUT_FILE
+3) run with --overwrite so you keep ONE working file
 
 Recommended deps if needed
     pip install pandas openpyxl requests python-dotenv beautifulsoup4 lxml selenium pyvirtualdisplay
@@ -78,14 +75,16 @@ except Exception:
 
 DEFAULT_ENV_PATH = "/content/drive/MyDrive/CI2/ci2_keys.env"
 
+# Your current working master file
 DEFAULT_INPUT_FILE = (
     "/content/drive/MyDrive/CI2/db/qwass2/"
-    "collector_manual_queue_20260317_042544_RECOVERED_20260318_1610.csv"
+    "collector_enriched_WORKING.csv"
 )
 
 DEFAULT_TEXT_COLUMN = "summary"
 
-SHORT_TEXT_MAX = 50
+# For the current phase, < 200 chars is a more useful default than < 50
+SHORT_TEXT_MAX = 200
 MIN_ACCEPT_CHARS = 200
 MIN_ACCEPT_WORDS = 40
 
@@ -98,6 +97,8 @@ DIFFBOT_BACKOFF_BASE_S = 8
 
 REMOVEPAYWALL_WAIT_AFTER_CLICK = 10
 REMOVEPAYWALL_ARTICLE_MIN_WORDS = 50
+
+AUTOSAVE_EVERY = 25
 
 ARCHIVE_SNAPSHOT_COLUMNS = [
     "archive_snapshot_url",
@@ -261,8 +262,14 @@ def parse_args():
         default=MIN_ACCEPT_WORDS,
         help="Minimum accepted word count for rescued text",
     )
+    parser.add_argument(
+        "--autosave-every",
+        type=int,
+        default=AUTOSAVE_EVERY,
+        help="Autosave every N successful updates. 0 disables autosave.",
+    )
 
-    # Important for Colab/Jupyter: ignore unknown kernel args like -f kernel.json
+    # Ignore Colab/Jupyter kernel args like -f kernel.json
     args, unknown = parser.parse_known_args()
     if unknown:
         print(f"⚠️ Ignoring unrecognized args: {unknown}")
@@ -400,7 +407,6 @@ def amp_variants(url: str) -> List[str]:
     if not url.endswith("/amp"):
         out.append(url.rstrip("/") + "/amp")
 
-    # optional amp subdomain variant
     if "://www." in url:
         out.append(url.replace("://www.", "://amp."))
 
@@ -443,7 +449,6 @@ def write_table(df: pd.DataFrame, output_file: str, kind: str):
         df.to_excel(output_file, index=False)
         return
 
-    # If output suffix missing/weird, fall back to same kind as input
     if kind == "csv":
         df.to_csv(output_file, index=False)
     else:
@@ -741,21 +746,20 @@ def build_chrome_driver():
     display.start()
 
     chromium_candidates = [
-        shutil.which("google-chrome"),
-        shutil.which("google-chrome-stable"),
-        shutil.which("chromium"),
-        shutil.which("chromium-browser"),
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium-browser-stable",
+        shutil.which("chromium-browser"),
+        shutil.which("chromium"),
+        shutil.which("google-chrome"),
+        shutil.which("google-chrome-stable"),
     ]
     chromedriver_candidates = [
-        shutil.which("chromedriver"),
-        "/usr/bin/chromedriver",
         "/usr/lib/chromium-browser/chromedriver",
         "/usr/lib/chromium/chromedriver",
+        "/usr/bin/chromedriver",
+        shutil.which("chromedriver"),
     ]
 
     chromium_path = find_existing_path(chromium_candidates)
@@ -763,13 +767,11 @@ def build_chrome_driver():
 
     if not chromium_path:
         raise RuntimeError(
-            "Could not find chromium/google-chrome binary. "
-            "Install Chromium in the runtime first."
+            "Could not find chromium/google-chrome binary. Install Chromium in the runtime first."
         )
     if not chromedriver_path:
         raise RuntimeError(
-            "Could not find chromedriver binary. "
-            "Install chromedriver in the runtime first."
+            "Could not find chromedriver binary. Install chromedriver in the runtime first."
         )
 
     ok, msg = validate_browser_stack(chromium_path, chromedriver_path)
@@ -783,12 +785,16 @@ def build_chrome_driver():
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--remote-debugging-port=9222")
+    options.add_argument("--user-data-dir=/tmp/chrome-user-data")
+    options.add_argument("--data-path=/tmp/chrome-data")
+    options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--hide-scrollbars")
     options.add_argument("--no-first-run")
     options.add_argument("--no-default-browser-check")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--single-process")
 
     service = ChromeService(executable_path=chromedriver_path)
     driver = webdriver.Chrome(service=service, options=options)
@@ -933,23 +939,25 @@ def main():
 
     print(f"Rows loaded: {len(df)}")
     print(f"Rows with {args.text_column} < {args.short_text_max} chars: {len(to_update_idx)}")
+    print(f"Output file: {output_file}")
 
     updated = 0
+    attempted = 0
 
-    for i in to_update_idx:
+    for n, i in enumerate(to_update_idx, start=1):
         row = df.loc[i].to_dict()
 
         url = safe_text(row.get("url"))
         title = safe_text(row.get("title"))
-        source = safe_text(row.get("source"))
         before = safe_text(row.get(args.text_column))
         archive_snapshot_url = get_first_present(row, ARCHIVE_SNAPSHOT_COLUMNS)
 
         if not url:
             continue
 
-        print(f"\n🔗 [{i}] {title}\n    {url}")
-        print(f"   Before chars: {len(before)}")
+        attempted += 1
+        print(f"\n[{n}/{len(to_update_idx)}] 🔗 Row {i}: {title}\n    {url}")
+        print(f"   Before chars: {len(before)} | words: {count_words(before)}")
 
         text, method = best_text_via_diffbot(
             original_url=url,
@@ -966,7 +974,6 @@ def main():
                 text = archive_text
                 method = f"archive:{archive_snapshot_url}"
 
-        # Generic browser fallback: no publication routing
         if (
             not good_article_text(text, args.min_accept_chars, args.min_accept_words)
             and USE_BROWSER_FALLBACK_DEFAULT
@@ -986,6 +993,10 @@ def main():
             df.at[i, "recovery_method"] = method
             updated += 1
             print(f"   ✅ UPDATED → {title} | {method} | chars: {len(text)} | words: {count_words(text)}")
+
+            if args.autosave_every and updated % args.autosave_every == 0:
+                write_table(df, output_file, input_kind)
+                print(f"   💾 AUTOSAVED after {updated} updates → {output_file}")
         else:
             print(f"   ❌ Skipped (only {len(text)} chars / {count_words(text)} words)")
 
@@ -993,7 +1004,8 @@ def main():
 
     write_table(df, output_file, input_kind)
 
-    print(f"\n🎯 Updated rows: {updated} / {len(to_update_idx)}")
+    print(f"\n🎯 Updated rows: {updated} / {len(to_update_idx)} targeted")
+    print(f"🧪 Attempted rows: {attempted}")
     print(f"💾 Saved output:\n   {output_file}")
 
 
